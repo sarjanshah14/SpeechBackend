@@ -1,6 +1,5 @@
 from fastapi import FastAPI, UploadFile, BackgroundTasks, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
-import whisper
 import uvicorn
 import tempfile
 import os
@@ -1257,7 +1256,6 @@ async def health_check():
     """Health check endpoint with feature list"""
     return {
         "status": "online",
-        "model": "whisper-base + Google STT Streaming",
         "products_loaded": len(product_manager.pcode_list),
         "queue_size": request_queue.qsize(),
         "is_processing": is_processing,
@@ -1277,13 +1275,7 @@ async def startup_event():
     """Start background worker on server startup"""
     global model, request_queue, processing_lock, is_processing
 
-    try:
-        print("🔄 Loading Whisper model...")
-        model = whisper.load_model("base")
-        print("✅ Whisper model loaded successfully")
-    except Exception as e:
-        print(f"⚠️ Warning: Could not load Whisper model: {e}")
-        print("   Whisper transcription will not be available")
+    
 
     asyncio.create_task(process_audio_worker())
     print("🚀 Background audio processing worker started")
