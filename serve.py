@@ -592,6 +592,7 @@ class UltraTextProcessor:
             (r'\bsicks\b', 'six'), (r'\bsevun\b', 'seven'),
             (r'\bate\b', 'eight'), (r'\bait\b', 'eight'),
             (r'\bnein\b', 'nine'), (r'\btin\b', 'ten'),(r'\bwon\b', 'one'),(r'\beven\b', 'E1'),
+            (r'\bsaid\b', 'z'),
         ]
 
         for pattern, replacement in letter_variants:
