@@ -1,0 +1,1300 @@
+from fastapi import FastAPI, UploadFile, BackgroundTasks, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse
+import whisper
+import uvicorn
+import tempfile
+import os
+import re
+import json
+import asyncio
+import requests
+from datetime import datetime
+from typing import List, Tuple, Optional, Dict
+from difflib import SequenceMatcher
+from collections import deque
+import csv
+import wave
+import google.cloud.speech as gspeech
+import base64
+import threading
+from queue import Queue
+import contextlib
+from concurrent.futures import ThreadPoolExecutor
+
+DEEPGRAM_KEY_PATH = r"C:\Users\itintern2\Desktop\one\one\service\keys\deepgram.key"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.join(
+    BASE_DIR, "service", "keys", "vigilant-art-475111-c1-cd0522c17ae2.json"
+)
+
+app = FastAPI()
+
+# ----------------------------------------------------------------------------
+# Simple per-connection session state to handle qty follow-up pairing
+# ----------------------------------------------------------------------------
+class SessionState:
+    def __init__(self):
+        self.waiting_for_qty = False
+        self.last_pcode: str = ""
+
+    def wait_for_qty(self, pcode: str):
+        self.waiting_for_qty = True
+        self.last_pcode = pcode
+
+    def clear(self):
+        self.waiting_for_qty = False
+        self.last_pcode = ""
+
+    def is_waiting(self) -> bool:
+        return self.waiting_for_qty and bool(self.last_pcode)
+
+# ============================================================================
+# STREAMING CONFIGURATION
+# ============================================================================
+STREAMING_CONFIG = {
+    "sample_rate": 16000,
+    "encoding": gspeech.RecognitionConfig.AudioEncoding.LINEAR16,
+    "language_code": "en-US",
+    "model": "latest_short",
+    "interim_results": True,
+    "single_utterance": False,
+}
+
+# ============================================================================
+# WEBSOCKET ENDPOINT: /stream_google
+# ============================================================================
+@app.websocket("/stream_google")
+async def stream_google(websocket: WebSocket):
+
+    await websocket.accept()
+    print("🔌 WebSocket connection established")
+
+    # Session configuration
+    use_stop_word = False
+    buffered_text = ""
+    STOP_WORDS = ["stop", "done", "next"]
+    CANCEL_WORDS = ["cancel", "again", "retry", "repeat", "redo", "restart"]
+
+    client = gspeech.SpeechClient()
+
+    recognition_config = gspeech.RecognitionConfig(
+        encoding=gspeech.RecognitionConfig.AudioEncoding.LINEAR16,
+        sample_rate_hertz=16000,
+        language_code="en-US",
+        enable_automatic_punctuation=True,
+        model="latest_long",
+    )
+
+    streaming_config = gspeech.StreamingRecognitionConfig(
+        config=recognition_config,
+        interim_results=True,
+        single_utterance=False,
+    )
+
+    q: Queue = Queue()
+    stop_event = threading.Event()
+
+    def request_generator_sync():
+        while not stop_event.is_set():
+            data = q.get()
+            if data is None:
+                break
+            yield gspeech.StreamingRecognizeRequest(audio_content=data)
+
+    loop = asyncio.get_running_loop()
+
+    def safe_thread_send(data):
+        """Safely send data through websocket from thread"""
+        try:
+            if websocket.client_state.name == "CONNECTED":
+                asyncio.run_coroutine_threadsafe(websocket.send_json(data), loop)
+        except Exception as e:
+            print(f"⚠️ Failed to send message: {e}")
+
+    def run_recognition():
+        nonlocal buffered_text
+        session_state = SessionState()
+
+        try:
+            responses = client.streaming_recognize(
+                streaming_config, requests=request_generator_sync()
+            )
+            for response in responses:
+                if not response.results:
+                    continue
+                result = response.results[0]
+                if not result.alternatives:
+                    continue
+                transcript = result.alternatives[0].transcript.strip()
+
+                # Skip empty or invalid transcripts
+                if not transcript or transcript in ['.', ',', '!', '?', '...', '..', '…']:
+                    print(f"⏭️ Skipping empty/invalid transcript: '{transcript}'")
+                    continue
+
+                # Remove trailing punctuation
+                transcript_clean = transcript.rstrip('.!?,;:')
+                if not transcript_clean:
+                    print(f"⏭️ Skipping transcript with only punctuation: '{transcript}'")
+                    continue
+
+                if use_stop_word:
+                    # ========== STOP WORD MODE ==========
+                    transcript_lower = transcript_clean.lower()
+
+                    # Check for CANCEL words
+                    cancel_word_found = None
+                    for cancel_word in CANCEL_WORDS:
+                        if cancel_word in transcript_lower:
+                            cancel_word_found = cancel_word
+                            break
+
+                    if cancel_word_found:
+                        if result.is_final:
+                            print(f"🔄 CANCEL WORD DETECTED ('{cancel_word_found}'): Discarding buffer and resetting")
+                            buffered_text = ""
+                            safe_thread_send({
+                                "type": "cancelled",
+                                "text": "",
+                                "message": f"Cancelled. Listening again...",
+                                "cancel_word": cancel_word_found
+                            })
+                            session_state.clear()
+                        continue
+
+                    # Check for STOP words
+                    stop_word_found = None
+                    for stop_word in STOP_WORDS:
+                        if stop_word in transcript_lower:
+                            stop_word_found = stop_word
+                            break
+
+                    if stop_word_found:
+                        if not result.is_final:
+                            continue
+
+                        # Remove stop word from transcript
+                        cleaned_transcript = re.sub(
+                            r'\b' + stop_word_found + r'\b',
+                            '',
+                            transcript_clean,
+                            flags=re.IGNORECASE
+                        ).strip()
+
+                        if cleaned_transcript and len(cleaned_transcript) > 1:
+                            if buffered_text:
+                                buffered_text += " " + cleaned_transcript
+                            else:
+                                buffered_text = cleaned_transcript
+
+                        # Finalize the buffered text
+                        if buffered_text and len(buffered_text.strip()) >= 3:
+                            print(f"🛑 STOP WORD DETECTED ('{stop_word_found}'): Finalizing buffer: {buffered_text}")
+
+                            processed = TranscriptionPipeline.process(
+                                buffered_text,
+                                raw_original_text=buffered_text,
+                                session_state=session_state,
+                            )
+
+                            pcode = processed.get("pcode", "")
+                            qty = processed.get("qty", "")
+                            confidence = processed.get("confidence", 0.0)
+                            is_qty_followup = processed.get("is_qty_followup", False)
+
+                            # Handle quantity follow-up
+                            if is_qty_followup:
+                                print(f"🔢 QUANTITY FOLLOW-UP: qty='{qty}'")
+                                safe_thread_send({
+                                    "type": "final",
+                                    "text": buffered_text,
+                                    "data": {
+                                        "pcode": "",
+                                        "qty": qty,
+                                        "confidence": 1.0,
+                                    }
+                                })
+                                session_state.clear()
+                                buffered_text = ""
+                                continue
+
+                            # Validate pcode if present
+                            if pcode:
+                                # Length validation
+                                if len(pcode) < 5:
+                                    print(f"❌ VALIDATION FAIL: Product code too short ('{pcode}')")
+                                    safe_thread_send({
+                                        "type": "validation_error",
+                                        "error_code": "INVALID_PCODE_LENGTH",
+                                        "message": f"Invalid product code '{pcode}' (minimum 5 characters required)",
+                                        "pcode": pcode,
+                                        "qty": qty
+                                    })
+                                    buffered_text = ""
+                                    continue
+
+                                # Product existence validation
+                                if not product_manager.exists(pcode):
+                                    print(f"❌ VALIDATION FAIL: Product '{pcode}' not found")
+                                    safe_thread_send({
+                                        "type": "validation_error",
+                                        "error_code": "NO_MATCH",
+                                        "message": f"Product code '{pcode}' not found. Please try again.",
+                                        "pcode": pcode,
+                                        "qty": qty
+                                    })
+                                    buffered_text = ""
+                                    continue
+
+                                # Success
+                                print(f"✅ VALIDATION PASSED: '{pcode}' + qty '{qty if qty else '(empty)'}'")
+                                safe_thread_send({
+                                    "type": "final",
+                                    "text": buffered_text,
+                                    "data": {
+                                        "pcode": pcode,
+                                        "qty": qty,
+                                        "confidence": confidence,
+                                    }
+                                })
+                                if qty:
+                                    session_state.clear()
+                                else:
+                                    session_state.wait_for_qty(pcode)
+                            else:
+                                # No pcode extracted
+                                print(f"❌ NO PCODE EXTRACTED from '{buffered_text}'")
+                                safe_thread_send({
+                                    "type": "validation_error",
+                                    "error_code": "NO_PCODE_FOUND",
+                                    "message": "Could not extract product code. Please speak clearly.",
+                                    "pcode": "",
+                                    "qty": ""
+                                })
+                                session_state.clear()
+
+                            buffered_text = ""
+                    else:
+                        # No stop/cancel word: accumulate in buffer
+                        if result.is_final:
+                            if buffered_text:
+                                buffered_text += " " + transcript_clean
+                            else:
+                                buffered_text = transcript_clean
+                            print(f"📝 Accumulated (final chunk): {buffered_text}")
+                            safe_thread_send({
+                                "type": "partial",
+                                "text": buffered_text
+                            })
+                        else:
+                            combined = (buffered_text + " " + transcript_clean).strip() if buffered_text else transcript_clean
+                            print(f"💬 Partial (accumulated): {combined}")
+                            safe_thread_send({
+                                "type": "partial",
+                                "text": combined
+                            })
+                else:
+                    # ========== NORMAL MODE ==========
+
+                    # Check for CANCEL words
+                    transcript_lower = transcript_clean.lower()
+                    cancel_word_found = None
+                    for cancel_word in CANCEL_WORDS:
+                        if cancel_word in transcript_lower:
+                            cancel_word_found = cancel_word
+                            break
+
+                    if cancel_word_found:
+                        print(f"🔄 CANCEL WORD DETECTED ('{cancel_word_found}'): Ignoring this transcription")
+                        safe_thread_send({
+                            "type": "cancelled",
+                            "message": f"Transcription cancelled. Say the product code again.",
+                            "cancel_word": cancel_word_found
+                        })
+                        session_state.clear()
+                        continue
+
+                    # Send partial results
+                    if not result.is_final:
+                        print(f"💬 PARTIAL: {transcript_clean}")
+                        safe_thread_send({
+                            "type": "partial",
+                            "text": transcript_clean
+                        })
+                        continue
+
+                    # Process final result
+                    if result.is_final:
+                        print(f"🗣 FINAL: {transcript_clean}")
+
+                        processed = TranscriptionPipeline.process(
+                            transcript_clean,
+                            raw_original_text=transcript_clean,
+                            session_state=session_state,
+                        )
+
+                        pcode = processed.get("pcode", "")
+                        qty = processed.get("qty", "")
+                        confidence = processed.get("confidence", 0.0)
+                        is_qty_followup = processed.get("is_qty_followup", False)
+
+                        # Handle quantity follow-up
+                        if is_qty_followup:
+                            print(f"🔢 QUANTITY FOLLOW-UP: qty='{qty}'")
+                            safe_thread_send({
+                                "type": "final",
+                                "text": transcript_clean,
+                                "data": {
+                                    "pcode": "",
+                                    "qty": qty,
+                                    "confidence": 1.0,
+                                }
+                            })
+                            session_state.clear()
+                            continue
+
+                        # Validate pcode if present
+                        if pcode:
+                            # Length validation
+                            if len(pcode) < 5:
+                                print(f"❌ VALIDATION FAIL: Product code too short ('{pcode}')")
+                                safe_thread_send({
+                                    "type": "validation_error",
+                                    "error_code": "INVALID_PCODE_LENGTH",
+                                    "message": f"Invalid product code '{pcode}' (minimum 5 characters required)",
+                                    "pcode": pcode,
+                                    "qty": qty
+                                })
+                                continue
+
+                            # Product existence validation
+                            if not product_manager.exists(pcode):
+                                print(f"❌ VALIDATION FAIL: Product '{pcode}' not found")
+                                safe_thread_send({
+                                    "type": "validation_error",
+                                    "error_code": "NO_MATCH",
+                                    "message": f"Product code '{pcode}' not found. Please try again.",
+                                    "pcode": pcode,
+                                    "qty": qty
+                                })
+                                continue
+
+                            # Success
+                            print(f"✅ VALIDATION PASSED: '{pcode}' + qty '{qty if qty else '(empty)'}'")
+                            safe_thread_send({
+                                "type": "final",
+                                "text": transcript_clean,
+                                "data": {
+                                    "pcode": pcode,
+                                    "qty": qty,
+                                    "confidence": confidence,
+                                }
+                            })
+                            if qty:
+                                session_state.clear()
+                            else:
+                                session_state.wait_for_qty(pcode)
+                        else:
+                            # No pcode extracted
+                            print(f"❌ NO PCODE EXTRACTED from '{transcript_clean}'")
+                            safe_thread_send({
+                                "type": "validation_error",
+                                "error_code": "NO_PCODE_FOUND",
+                                "message": "Could not extract product code. Please speak clearly.",
+                                "pcode": "",
+                                "qty": ""
+                            })
+                            session_state.clear()
+
+        except Exception as e:
+            print(f"❌ Error in process_responses: {e}")
+            safe_thread_send({
+                "type": "error",
+                "message": str(e)
+            })
+
+    executor = ThreadPoolExecutor(max_workers=1)
+    _future = loop.run_in_executor(executor, run_recognition)
+
+    print("🧠 Google STT streaming started")
+
+    try:
+        while True:
+            message = await websocket.receive()
+            data_bytes = message.get("bytes")
+            text = message.get("text")
+
+            if data_bytes is not None:
+                q.put(data_bytes)
+                print(f"📥 Received {len(data_bytes)} bytes of audio")
+            elif text is not None:
+                try:
+                    payload = json.loads(text)
+                except Exception:
+                    payload = {}
+
+                if isinstance(payload, dict):
+                    if payload.get("type") == "config":
+                        use_stop_word = payload.get("use_stop_word", False)
+                        print(f"⚙️ Configuration updated: use_stop_word={use_stop_word}")
+                        await websocket.send_json({
+                            "type": "config_ack",
+                            "use_stop_word": use_stop_word
+                        })
+                    elif payload.get("type") == "stop":
+                        print("🛑 Stop received")
+                        stop_event.set()
+                        q.put(None)
+                        break
+            else:
+                pass
+
+    except WebSocketDisconnect:
+        print("🔌 WebSocket disconnected")
+    except Exception as e:
+        print(f"WebSocket error: {e}")
+        try:
+            await websocket.send_json({"type": "error", "message": str(e)})
+        except:
+            pass
+    finally:
+        stop_event.set()
+        q.put(None)
+        print("🧹 Shutting down executor...")
+        try:
+            executor.shutdown(wait=True, cancel_futures=True)
+        except Exception as e:
+            print(f"⚠️ Executor shutdown warning: {e}")
+        print("🧠 Google STT streaming ended")
+        try:
+            await websocket.close()
+        except Exception as e:
+            print(f"⚠️ WebSocket close warning: {e}")
+
+class ProductListManager:
+    def __init__(self, csv_file: str = "productlist.csv"):
+        self.pcode_list = []
+        self.pcode_set = set()
+        self.pcode_dict = {}
+        self.load_product_list(csv_file)
+
+    def load_product_list(self, csv_file: str):
+        if not os.path.exists(csv_file):
+            print(f"⚠️  Warning: {csv_file} not found. Running without product validation.")
+            return
+        try:
+            with open(csv_file, 'r', encoding='utf-8-sig') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    pcode = str(row['productid']).strip()
+                    if len(pcode) >= 3:
+                        self.pcode_list.append(pcode)
+                        self.pcode_set.add(pcode.lower())
+                        self.pcode_dict[pcode.lower()] = pcode
+            print(f"✅ Loaded {len(self.pcode_list)} product codes")
+        except Exception as e:
+            print(f"❌ Error loading CSV: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def exists(self, pcode: str) -> bool:
+        return pcode.lower() in self.pcode_set
+
+    def get_exact_case(self, pcode: str) -> str:
+        return self.pcode_dict.get(pcode.lower(), pcode)
+
+    def find_best_match(self, pcode: str, min_similarity: float = 0.80) -> Optional[str]:
+        best_match = None
+        best_score = 0.0
+        pcode_clean = pcode.lower().strip()
+        for prod_code in self.pcode_list[:5000]:
+            prod_clean = str(prod_code).lower().strip()
+            score = SequenceMatcher(None, pcode_clean, prod_clean).ratio()
+            if score > best_score and score >= min_similarity:
+                best_score = score
+                best_match = prod_code
+        if best_match:
+            print(f"  🔍 Fuzzy matched '{pcode}' -> '{best_match}' (score: {best_score:.2f})")
+            return best_match
+        return None
+
+class UltraTextProcessor:
+    NUMBERS = {
+        'zero': '0', 'oh': '0', 'o': '0',
+        'one': '1', 'two': '2', 'to': '2', 'too': '2',
+        'three': '3', 'four': '4', 'five': '5',
+        'six': '6', 'seven': '7', 'eight': '8', 'nine': '9',
+        'ten': '10', 'eleven': '11', 'twelve': '12', 'thirteen': '13',
+        'fourteen': '14', 'fifteen': '15', 'sixteen': '16', 'seventeen': '17',
+        'eighteen': '18', 'nineteen': '19',
+        'twenty': '20', 'thirty': '30', 'forty': '40', 'fifty': '50',
+        'sixty': '60', 'seventy': '70', 'eighty': '80', 'ninety': '90'
+    }
+
+    SIMILAR_CHARS = {
+        'a': ['e', 'o', 'j'], 'b': ['d', 'p', 'v'], 'c': ['s', 'k', 'g'],
+        'd': ['b', 't'], 'e': ['a', 'i'], 'f': ['v', 'p', 's'],
+        'g': ['j', 'k', 'c'], 'h': ['n'], 'i': ['e', 'y'],
+        'j': ['g', 'a'], 'k': ['c', 'g', 'q'], 'l': ['r', 'i'],
+        'm': ['n'], 'n': ['m'], 'o': ['a', 'u'],
+        'p': ['b', 'f'], 'q': ['k'], 'r': ['l'],
+        's': ['f', 'c', 'z'], 't': ['d'], 'u': ['o'],
+        'v': ['f', 'w'], 'w': ['v', 'double'], 'x': ['z'],
+        'y': ['i'], 'z': ['s', 'x'],
+    }
+
+    @staticmethod
+    def clean_text(text: str) -> str:
+        """Clean text but preserve spaces until after double/triple conversion"""
+        text = text.lower().strip()
+
+        # STEP 1: Handle compound numbers (with spaces)
+        tens_pattern = r'\b(twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)\s+(one|two|three|four|five|six|seven|eight|nine)\b'
+        def replace_compound(match):
+            tens_map = {'twenty': '20', 'thirty': '30', 'forty': '40', 'fifty': '50',
+                        'sixty': '60', 'seventy': '70', 'eighty': '80', 'ninety': '90'}
+            ones_map = {'one': '1', 'two': '2', 'three': '3', 'four': '4', 'five': '5',
+                        'six': '6', 'seven': '7', 'eight': '8', 'nine': '9'}
+            return str(int(tens_map[match.group(1)]) + int(ones_map[match.group(2)]))
+        text = re.sub(tens_pattern, replace_compound, text)
+
+        # STEP 1.5: Handle "w0", "w1", etc. -> "double 0", "double 1"
+        text = re.sub(r'\bw(\d)\b', r'double \1', text)
+
+        # STEP 2: Replace piece variants (before space removal)
+        piece_variants = [
+            (r'\bplease\b', 'piece'), (r'\bpleas\b', 'piece'), (r'\bpeace\b', 'piece'),
+            (r'\bpeas\b', 'piece'), (r'\bpees\b', 'piece'), (r'\bpease\b', 'piece'),
+            (r'\bpeice\b', 'piece'), (r'\bpeese\b', 'piece'), (r'\bpies\b', 'piece'),
+            (r'\bpis\b', 'piece'), (r'\bp\s+s\b', 'piece'), (r'\bps\b', 'piece'),
+            (r'\bp\s+c\b', 'piece'), (r'\bpc\b', 'piece'), (r'\bpcs\b', 'piece'),
+            (r'\bpeaces\b', 'piece'), (r'\bpeeses\b', 'piece'), (r'\bpiecies\b', 'piece'),
+            (r'\bpieces\b', 'piece'),
+            (r'\bquantity\b', 'piece'), (r'\bquantities\b', 'piece'), (r'\bqty\b', 'piece'),
+        ]
+
+        for pattern, replacement in piece_variants:
+            text = re.sub(pattern, replacement, text)
+
+        # STEP 3: Replace letter spellings (before space removal)
+        letter_variants = [
+            (r'\bhe\b', 'e'), (r'\bay\b', 'a'), (r'\bee\b', 'e'),
+            (r'\bsee\b', 'c'), (r'\bdee\b', 'd'), (r'\bef\b', 'f'),
+            (r'\bgee\b', 'g'), (r'\baych\b', 'h'), (r'\bjay\b', 'j'),
+            (r'\bkay\b', 'k'), (r'\bell\b', 'l'), (r'\bem\b', 'm'),
+            (r'\ben\b', 'n'), (r'\boh\b', 'o'), (r'\bpea\b', 'p'),
+            (r'\bqueue\b', 'q'), (r'\bar\b', 'r'), (r'\bess\b', 's'),
+            (r'\btea\b', 't'), (r'\byou\b', 'u'), (r'\bvee\b', 'v'),
+            (r'\bdouble you\b', 'w'), (r'\bex\b', 'x'), (r'\bwhy\b', 'y'),
+            (r'\bzed\b', 'z'), (r'\bzee\b', 'z'),
+            # Additional number word variants
+            (r'\bwhen\b', 'one'), (r'\bwon\b', 'one'), (r'\bwun\b', 'one'),
+            (r'\btree\b', 'three'), (r'\bfife\b', 'five'),
+            (r'\bsicks\b', 'six'), (r'\bsevun\b', 'seven'),
+            (r'\bate\b', 'eight'), (r'\bait\b', 'eight'),
+            (r'\bnein\b', 'nine'), (r'\btin\b', 'ten'),(r'\bwon\b', 'one'),(r'\beven\b', 'E1'),
+        ]
+
+        for pattern, replacement in letter_variants:
+            text = re.sub(pattern, replacement, text)
+
+        # STEP 4: Remove filler words
+        text = re.sub(r'\b(um|uh|like|you know|okay|ok|is|the|a|an|and|or|of|in|at|with|for|on)\b', ' ', text)
+
+        # STEP 5: Remove punctuation (but keep spaces!)
+        text = re.sub(r'[,!?;:\'"()-]', ' ', text)
+
+        # STEP 6: Normalize multiple spaces to single space
+        text = re.sub(r'\s+', ' ', text).strip()
+
+        return text
+
+    @staticmethod
+    def convert_doubles_triples(text: str) -> str:
+        """Convert double/triple patterns - MUST be called BEFORE space removal"""
+        max_iterations = 10
+        iteration = 0
+
+        while iteration < max_iterations:
+            iteration += 1
+            original = text
+
+            # SPECIAL CASE: "double to" or "double two" at the start should become "22"
+            text = re.sub(r'^double\s+to\b', '22', text, flags=re.IGNORECASE)
+            text = re.sub(r'^double\s+two\b', '22', text, flags=re.IGNORECASE)
+            text = re.sub(r'\bdouble\s+to\s+(\d)', r'22\1', text, flags=re.IGNORECASE)
+            text = re.sub(r'\bdouble\s+two\s+(\d)', r'22\1', text, flags=re.IGNORECASE)
+            text = re.sub(r'\bdouble\s+to\s+(\w)', r'22\1', text, flags=re.IGNORECASE)
+            text = re.sub(r'\bdouble\s+two\s+(\w)', r'22\1', text, flags=re.IGNORECASE)
+
+            text = re.sub(r'\bdouble\s+zero\b', '00', text, flags=re.IGNORECASE)
+            text = re.sub(r'\bdouble\s+oh\b', '00', text, flags=re.IGNORECASE)
+            text = re.sub(r'\bdouble\s+o\b', '00', text, flags=re.IGNORECASE)
+            text = re.sub(r'\bdouble\s+one\b', '11', text, flags=re.IGNORECASE)
+            text = re.sub(r'\bdouble\s+two\b', '22', text, flags=re.IGNORECASE)
+            text = re.sub(r'\bdouble\s+three\b', '33', text, flags=re.IGNORECASE)
+            text = re.sub(r'\bdouble\s+four\b', '44', text, flags=re.IGNORECASE)
+            text = re.sub(r'\bdouble\s+five\b', '55', text, flags=re.IGNORECASE)
+            text = re.sub(r'\bdouble\s+six\b', '66', text, flags=re.IGNORECASE)
+            text = re.sub(r'\bdouble\s+seven\b', '77', text, flags=re.IGNORECASE)
+            text = re.sub(r'\bdouble\s+eight\b', '88', text, flags=re.IGNORECASE)
+            text = re.sub(r'\bdouble\s+nine\b', '99', text, flags=re.IGNORECASE)
+
+            # Handle "triple 0" -> "000", "double 5" -> "55", etc.
+            text = re.sub(r'\btriple\s+(\d)\b', lambda m: m.group(1) * 3, text, flags=re.IGNORECASE)
+            text = re.sub(r'\bdouble\s+(\d)\b', lambda m: m.group(1) * 2, text, flags=re.IGNORECASE)
+
+            # -----------------------------------------------------------------
+            # Generalized handling: apply to the immediate next number token
+            # Works across optional spaces/punctuation and compact forms
+            # Examples:
+            #  - "double 2544" -> "22544" (repeat first digit of next number token)
+            #  - "triple 987" -> "99987"
+            #  - "double two five" -> "two two five" (later -> 22 5 -> 225)
+            #  - "double2" -> "22"
+            #  - "tripletwo" -> "two two two" (later -> 222)
+            # -----------------------------------------------------------------
+
+            # 1) Compact forms: double2, triple5, doubletwo, tripletwo, etc.
+            number_words = r"zero|oh|o|one|two|to|too|three|four|five|six|seven|eight|nine"
+
+            def repl_compact_digit(m):
+                kind = m.group(1).lower()
+                d = m.group(2)
+                rest = m.group(3) or ""
+                times = 2 if kind == 'double' else 3
+                return (d * times) + rest
+
+            text = re.sub(r"\b(double|triple)(\d)(\d*)\b", repl_compact_digit, text, flags=re.IGNORECASE)
+
+            def repl_compact_word(m):
+                kind = m.group(1).lower()
+                w = m.group(2)
+                times = 2 if kind == 'double' else 3
+                return (w + ' ') * (times - 1) + w
+
+            text = re.sub(r"\b(double|triple)\b(" + number_words + r")\b", repl_compact_word, text, flags=re.IGNORECASE)
+
+            # 2) Spaced/punct-separated forms: double ... 2544, triple, two, etc.
+            # Repeat only the first numeric token encountered after the keyword.
+            def repl_next_digit(m):
+                kind = m.group(1).lower()
+                d = m.group(2)
+                rest = m.group(3) or ""
+                times = 2 if kind == 'double' else 3
+                return (d * times) + rest
+
+            # Allow commas, periods, spaces, colons, semicolons, hyphens between keyword and number
+            text = re.sub(r"\b(double|triple)\b[\s,.;:-]*([0-9])([0-9]*)\b", repl_next_digit, text, flags=re.IGNORECASE)
+
+            def repl_next_word(m):
+                kind = m.group(1).lower()
+                w = m.group(2)
+                times = 2 if kind == 'double' else 3
+                return (w + ' ') * (times - 1) + w
+
+            text = re.sub(r"\b(double|triple)\b[\s,.;:-]*(" + number_words + r")\b", repl_next_word, text, flags=re.IGNORECASE)
+
+            if text == original:
+                break
+
+        return text
+
+    @staticmethod
+    def convert_number_words(text: str) -> str:
+        """Convert number words to digits"""
+        for word, digit in UltraTextProcessor.NUMBERS.items():
+            text = re.sub(r'\b' + word + r'\b', digit, text, flags=re.IGNORECASE)
+        return text
+
+    @staticmethod
+    def convert_large_units(text: str) -> str:
+        """Convert phrases like 'three hundred'/'ten thousand' into digits.
+        Assumes number words have already been converted to digits.
+        Handles optional separators and optional trailing smaller numbers.
+        Examples:
+        - '3 hundred' -> '300'
+        - '3 hundred 45' -> '345'
+        - '10 thousand' -> '10000'
+        - '2 thousand 16' -> '2016'
+        - '2, thousand, 7' -> '2007'
+        """
+        def repl_thousand(m):
+            a = int(m.group(1))
+            b = m.group(2)
+            tail = int(b) if b and b.isdigit() else 0
+            return str(a * 1000 + tail)
+
+        def repl_hundred(m):
+            a = int(m.group(1))
+            b = m.group(2)
+            tail = int(b) if b and b.isdigit() else 0
+            return str(a * 100 + tail)
+
+        # Iterate to catch nested or sequential patterns safely
+        for _ in range(10):
+            prev = text
+            # thousand first (bigger unit)
+            text = re.sub(r"\b(\d+)\b[\s,.;:-]*(?:and\s+)?thousand\b[\s,.;:-]*(?:and\s+)?(\d{1,3})?\b",
+                          repl_thousand, text, flags=re.IGNORECASE)
+            # then hundred
+            text = re.sub(r"\b(\d+)\b[\s,.;:-]*(?:and\s+)?hundred\b[\s,.;:-]*(?:and\s+)?(\d{1,2})?\b",
+                          repl_hundred, text, flags=re.IGNORECASE)
+            if text == prev:
+                break
+        return text
+
+    @staticmethod
+    def process(text: str) -> str:
+        """Main processing pipeline - ORDER MATTERS!"""
+        print(f"  📥 Input: '{text}'")
+
+        # STEP 1: Clean text (preserves spaces)
+        text = UltraTextProcessor.clean_text(text)
+        print(f"  🧹 Cleaned: '{text}'")
+
+        # STEP 2: Convert doubles/triples (REQUIRES spaces!)
+        text = UltraTextProcessor.convert_doubles_triples(text)
+        print(f"  2️⃣ Doubles/Triples: '{text}'")
+
+        # STEP 3: Convert number words to digits
+        text = UltraTextProcessor.convert_number_words(text)
+        print(f"  🔢 Numbers: '{text}'")
+
+        # STEP 4: Convert large unit phrases (hundred/thousand)
+        text = UltraTextProcessor.convert_large_units(text)
+        print(f"  💯 Large units: '{text}'")
+
+        # STEP 5: NOW remove all spaces
+        text = re.sub(r'\s+', '', text)
+        text = text.replace('.', '')
+        print(f"  🔧 Spaces removed: '{text}'")
+
+        return text
+
+
+class TranscriptionPipeline:
+    """Complete processing pipeline with proper qty follow-up logic"""
+
+    @staticmethod
+    def process(raw_text: str, raw_original_text: Optional[str] = None, session_state = None) -> Dict:
+        print(f"\n{'='*70}")
+
+        if not raw_text or not isinstance(raw_text, str):
+            print(f"⚠️  Invalid input type, skipping")
+            print(f"{'='*70}\n")
+            return {
+                "raw_text": "",
+                "normalized": "",
+                "candidates": [],
+                "pcode": "",
+                "qty": "",
+                "confidence": 0.0,
+                "is_qty_followup": False
+            }
+
+        if not raw_text.strip() or raw_text.strip() in ['.', ',', '!', '?', '...']:
+            print(f"⚠️  Empty or invalid input, skipping")
+            print(f"{'='*70}\n")
+            return {
+                "raw_text": raw_text.strip(),
+                "normalized": "",
+                "candidates": [],
+                "pcode": "",
+                "qty": "",
+                "confidence": 0.0,
+                "is_qty_followup": False
+            }
+
+        try:
+            # 🔥 CRITICAL FIX: Only treat as qty follow-up if actively waiting
+            if session_state and session_state.is_waiting():
+                # Normalize the utterance first so letter variants, doubles/triples,
+                # and large-unit phrases are honored before extracting digits.
+                normalized_for_qty = UltraTextProcessor.process(raw_text)
+                digits_only = re.sub(r'\D', '', normalized_for_qty)
+
+                if digits_only:
+                    try:
+                        qty_val = int(digits_only)
+                        if 1 <= qty_val <= 9999:
+                            print(f"🔢 QUANTITY FOLLOW-UP: '{digits_only}' (waiting for {session_state.last_pcode})")
+                            return {
+                                "raw_text": raw_text.strip(),
+                                "normalized": normalized_for_qty,
+                                "candidates": [],
+                                "pcode": "",
+                                "qty": digits_only,
+                                "confidence": 1.0,
+                                "is_qty_followup": True
+                            }
+                    except:
+                        pass
+
+            # Normal processing pipeline
+            normalized = UltraTextProcessor.process(raw_text)
+
+            original_for_processing = raw_text if raw_original_text is None else raw_original_text
+            candidates = SmartExtractor.extract(normalized, product_manager)
+
+            if candidates:
+                best_pcode, best_qty, conf = candidates[0]
+                final_pcode, final_qty, final_conf = FinalValidator.validate(
+                    best_pcode, best_qty, product_manager
+                )
+
+                print(f"✅ FINAL -> Product: {final_pcode or 'NO MATCH'} | Qty: {final_qty or 'N/A'}")
+                print(f"📊 Confidence: {final_conf}")
+                print(f"{'='*70}\n")
+
+                return {
+                    "raw_text": raw_text.strip(),
+                    "normalized": normalized,
+                    "candidates": [(c[0], c[1]) for c in candidates[:3]],
+                    "pcode": final_pcode,
+                    "qty": final_qty,
+                    "confidence": round(final_conf, 2),
+                    "is_qty_followup": False
+                }
+            else:
+                print(f"❌ NO MATCH FOUND")
+                print(f"{'='*70}\n")
+                return {
+                    "raw_text": raw_text.strip(),
+                    "normalized": normalized,
+                    "candidates": [],
+                    "pcode": "",
+                    "qty": "",
+                    "confidence": 0.0,
+                    "is_qty_followup": False
+                }
+
+        except Exception as e:
+            print(f"❌ ERROR in TranscriptionPipeline: {e}")
+            import traceback
+            traceback.print_exc()
+            print(f"{'='*70}\n")
+            return {
+                "error": str(e),
+                "raw_text": raw_text.strip(),
+                "normalized": "",
+                "candidates": [],
+                "pcode": "",
+                "qty": "",
+                "confidence": 0.0,
+                "is_qty_followup": False
+            }
+
+class SmartExtractor:
+    @staticmethod
+    def extract(text: str, product_manager: ProductListManager) -> List[Tuple[str, str, float]]:
+        # 🆕 STEP 0: Remove ALL spaces from input text for processing
+        text_no_space = text.replace(' ', '').lower()
+        print(f"  🔧 Text (spaces removed): '{text_no_space}'")
+
+        # 🆕 STEP 1: Try direct extraction patterns (for cases like "3528325")
+        # Check if entire string (or prefix) matches a valid product code
+        for end_pos in range(5, min(len(text_no_space) + 1, 20)):  # Min 5 chars for pcode
+            pcode_candidate = text_no_space[:end_pos]
+
+            if product_manager.exists(pcode_candidate):
+                remaining = text_no_space[end_pos:]
+                qty = ""
+
+                if remaining:
+                    digits_only = re.sub(r'\D', '', remaining)
+                    if digits_only and 1 <= int(digits_only) <= 9999:
+                        qty = digits_only
+
+                pcode = product_manager.get_exact_case(pcode_candidate)
+                print(f"  ✅ DIRECT MATCH: '{pcode}' + qty '{qty if qty else '(none)'}'")
+                return [(pcode, qty, 1.0 if qty else 0.95)]
+
+        # STEP 2: Look for "piece" keyword in original text
+        piece_pos = -1
+        piece_variants = ['piece', 'pieces']
+        text_lower = text.lower()
+
+        for variant in piece_variants:
+            if variant in text_lower:
+                piece_pos = text_lower.index(variant)
+                print(f"  📍 Found '{variant}' at position {piece_pos}")
+                break
+
+        if piece_pos > 0:
+            before_piece = text[:piece_pos].strip()
+            after_piece = text[piece_pos:].strip()
+
+            for variant in piece_variants:
+                after_piece = re.sub(r'\b' + variant + r'\b', '', after_piece, flags=re.IGNORECASE)
+            after_piece = after_piece.strip()
+
+            print(f"  📦 Before piece: '{before_piece}'")
+            print(f"  📊 After piece: '{after_piece}'")
+
+            before_no_space = before_piece.replace(' ', '').lower()
+            print(f"  🔧 Before (no spaces): '{before_no_space}'")
+
+            qty = ""
+            best_match = None
+            best_match_type = None
+            best_match_end_pos = 0
+
+            candidates = []
+
+            for end_pos in range(3, len(before_no_space) + 1):
+                candidate = before_no_space[:end_pos]
+
+                if not candidate[0].isalpha():
+                    continue
+
+                if not any(c.isdigit() for c in candidate):
+                    continue
+
+                if product_manager.exists(candidate):
+                    remaining = before_no_space[end_pos:]
+                    candidates.append({
+                        'pcode': candidate,
+                        'remaining': remaining,
+                        'end_pos': end_pos,
+                        'type': 'exact',
+                        'priority': 1
+                    })
+                    print(f"  🎯 Found exact match candidate: '{candidate}' with remaining: '{remaining}'")
+
+            if candidates:
+                candidates.sort(key=lambda x: len(x['pcode']))
+                best_candidate = candidates[0]
+                best_match = best_candidate['pcode']
+                best_match_type = 'exact'
+                best_match_end_pos = best_candidate['end_pos']
+                remaining = best_candidate['remaining']
+
+                print(f"  ✅ Selected shortest exact match: '{best_match}' (from {len(candidates)} candidates)")
+
+                if remaining:
+                    digits_only = re.sub(r'\D', '', remaining)
+                    if digits_only:
+                        qty_val = int(digits_only)
+                        if 1 <= qty_val <= 9999:
+                            qty = digits_only
+                            print(f"  ✅ Quantity from remaining: '{qty}'")
+
+                pcode = product_manager.get_exact_case(best_match)
+                print(f"  ✅ EXACT: '{pcode}' + qty '{qty}'")
+                return [(pcode, qty, 1.0 if qty else 0.95)]
+
+            for end_pos in range(3, len(before_no_space) + 1):
+                candidate = before_no_space[:end_pos]
+
+                if not candidate[0].isalpha():
+                    continue
+
+                if not any(c.isdigit() for c in candidate):
+                    continue
+
+                fuzzy = product_manager.find_best_match(candidate)
+                if fuzzy:
+                    best_match = candidate
+                    best_match_type = 'fuzzy'
+                    best_match_end_pos = end_pos
+                    print(f"  🔍 Found fuzzy match: '{candidate}' -> '{fuzzy}'")
+                    break
+
+            if best_match and best_match_type == 'fuzzy':
+                remaining = before_no_space[best_match_end_pos:]
+
+                if remaining:
+                    digits_only = re.sub(r'\D', '', remaining)
+                    if digits_only:
+                        qty_val = int(digits_only)
+                        if 1 <= qty_val <= 9999:
+                            qty = digits_only
+                            print(f"  ✅ Quantity from remaining: '{qty}'")
+
+                fuzzy_pcode = product_manager.find_best_match(best_match)
+                if fuzzy_pcode:
+                    print(f"  ✅ FUZZY: '{best_match}' -> '{fuzzy_pcode}' + qty '{qty}'")
+                    return [(fuzzy_pcode, qty, 0.9 if qty else 0.85)]
+
+            if not qty and after_piece:
+                qty_match = re.search(r'\b(\d{1,4})\b', after_piece)
+                if qty_match:
+                    qty = qty_match.group(1)
+                    print(f"  ✅ Quantity from after piece: '{qty}'")
+
+            if before_no_space and len(before_no_space) >= 3:
+                if before_no_space[0].isalpha() and any(c.isdigit() for c in before_no_space):
+                    print(f"  ⚠️  Unverified: '{before_no_space}' + qty '{qty}'")
+                    return [(before_no_space, qty, 0.5)]
+
+        print(f"  🔍 No 'piece' found, trying direct extraction from: '{text_no_space}'")
+
+        candidates = []
+        for end_pos in range(5, len(text_no_space) + 1):
+            candidate = text_no_space[:end_pos]
+
+            if not candidate[0].isalpha():
+                continue
+
+            if not any(c.isdigit() for c in candidate):
+                continue
+
+            if product_manager.exists(candidate):
+                remaining = text_no_space[end_pos:]
+                digits_only = re.sub(r'\D', '', remaining)
+
+                candidates.append({
+                    'pcode': candidate,
+                    'remaining': digits_only,
+                    'end_pos': end_pos,
+                    'type': 'exact'
+                })
+                print(f"  🎯 Direct match candidate: '{candidate}' with remaining: '{digits_only}'")
+
+        if candidates:
+            candidates.sort(key=lambda x: len(x['pcode']))
+            best_candidate = candidates[0]
+
+            pcode = product_manager.get_exact_case(best_candidate['pcode'])
+            qty = best_candidate['remaining'] if best_candidate['remaining'] else ""
+
+            if qty:
+                try:
+                    qty_val = int(qty)
+                    if qty_val < 1 or qty_val > 9999:
+                        qty = ""
+                except:
+                    qty = ""
+
+            print(f"  ✅ Direct EXACT: '{pcode}' + qty '{qty}'")
+            return [(pcode, qty, 1.0 if qty else 0.95)]
+
+        for end_pos in range(3, len(text_no_space) + 1):
+            candidate = text_no_space[:end_pos]
+
+            if not candidate[0].isalpha():
+                continue
+
+            if not any(c.isdigit() for c in candidate):
+                continue
+
+            fuzzy = product_manager.find_best_match(candidate)
+            if fuzzy:
+                remaining = text_no_space[end_pos:]
+                digits_only = re.sub(r'\D', '', remaining)
+
+                qty = ""
+                if digits_only:
+                    try:
+                        qty_val = int(digits_only)
+                        if 1 <= qty_val <= 9999:
+                            qty = digits_only
+                    except:
+                        pass
+
+                print(f"  ✅ Direct FUZZY: '{candidate}' -> '{fuzzy}' + qty '{qty}'")
+                return [(fuzzy, qty, 0.88 if qty else 0.83)]
+
+        for pcode in product_manager.pcode_list[:5000]:
+            pcode_lower = str(pcode).lower()
+            if len(pcode_lower) < 3:
+                continue
+
+            if pcode_lower in text_no_space:
+                idx = text_no_space.index(pcode_lower)
+                after = text_no_space[idx + len(pcode_lower):]
+
+                digits_only = re.sub(r'\D', '', after)
+                qty_match = re.match(r'^(\d{1,4})', digits_only)
+                qty = qty_match.group(1) if qty_match else ""
+
+                print(f"  ✅ Found in text: '{pcode}' + qty '{qty}'")
+                return [(pcode, qty, 0.95)]
+
+        matches = re.findall(r'[a-z]+\d+[a-z0-9]*', text_no_space)
+        for match in matches:
+            if len(match) >= 3:
+                fuzzy = product_manager.find_best_match(match)
+                if fuzzy:
+                    idx = text_no_space.index(match)
+                    after = text_no_space[idx + len(match):]
+
+                    digits_only = re.sub(r'\D', '', after)
+                    qty_match = re.match(r'^(\d{1,4})', digits_only)
+                    qty = qty_match.group(1) if qty_match else ""
+
+                    print(f"  ✅ Pattern Fuzzy: '{match}' -> '{fuzzy}' + qty '{qty}'")
+                    return [(fuzzy, qty, 0.88)]
+
+        print(f"  ❌ No match found")
+        return []
+
+class CharacterConfusionCorrector:
+    @staticmethod
+    def find_similar_pcodes(pcode: str, product_manager: ProductListManager) -> List[str]:
+        if not pcode:
+            return []
+
+        candidates = [pcode.lower()]
+
+        for i, char in enumerate(pcode.lower()):
+            if char in UltraTextProcessor.SIMILAR_CHARS:
+                for similar in UltraTextProcessor.SIMILAR_CHARS[char]:
+                    variant = pcode[:i].lower() + similar + pcode[i+1:].lower()
+                    candidates.append(variant)
+
+        found = []
+        for candidate in candidates:
+            if product_manager.exists(candidate):
+                found.append(candidate)
+                if candidate != pcode.lower():
+                    print(f"  ⚠️  Confusion corrected: '{pcode}' → '{candidate}'")
+
+        return found if found else [pcode.lower()]
+
+class FinalValidator:
+    @staticmethod
+    def validate(pcode: str, qty: str, product_manager: ProductListManager) -> Tuple[str, str, float]:
+        qty_clean = re.sub(r'\D', '', qty) if qty else ""
+
+        if qty_clean:
+            try:
+                qty_int = int(qty_clean)
+                if qty_int < 1 or qty_int > 9999:
+                    qty_clean = ""
+            except:
+                qty_clean = ""
+
+        if product_manager.exists(pcode):
+            pcode_exact = product_manager.get_exact_case(pcode)
+            confidence = 1.0 if qty_clean else 0.95
+            return pcode_exact, qty_clean, confidence
+
+        similar = CharacterConfusionCorrector.find_similar_pcodes(pcode, product_manager)
+        if similar and similar[0] != pcode.lower():
+            pcode_exact = product_manager.get_exact_case(similar[0])
+            confidence = 0.92 if qty_clean else 0.88
+            return pcode_exact, qty_clean, confidence
+
+        fuzzy = product_manager.find_best_match(pcode)
+        if fuzzy:
+            confidence = 0.85 if qty_clean else 0.80
+            return fuzzy, qty_clean, confidence
+
+        return "", "", 0.0
+
+product_manager = ProductListManager("productlist.csv")
+
+request_queue = asyncio.Queue(maxsize=100)
+processing_lock = asyncio.Lock()
+is_processing = False
+model = None
+
+async def process_audio_worker():
+    """Background worker for processing audio with enhanced error handling"""
+    global is_processing
+    while True:
+        try:
+            audio_path, result_container = await request_queue.get()
+
+            async with processing_lock:
+                is_processing = True
+
+            print(f"🔄 Processing queued audio: {audio_path}")
+
+            try:
+                result = model.transcribe(audio_path, language='en')
+                raw_text = result["text"]
+
+                processed = TranscriptionPipeline.process(raw_text, raw_original_text=raw_text)
+                result_container['result'] = processed
+                result_container['done'] = True
+
+            except Exception as e:
+                import traceback
+                print(f"❌ Error processing audio: {e}")
+                traceback.print_exc()
+                result_container['result'] = {
+                    "error": str(e),
+                    "raw_text": "",
+                    "pcode": "",
+                    "qty": "",
+                    "confidence": 0.0
+                }
+                result_container['done'] = True
+
+            finally:
+                try:
+                    if os.path.exists(audio_path):
+                        os.remove(audio_path)
+                except Exception as cleanup_error:
+                    print(f"⚠️  Cleanup warning: {cleanup_error}")
+
+                async with processing_lock:
+                    is_processing = False
+
+                request_queue.task_done()
+
+        except Exception as e:
+            print(f"❌ Worker error: {e}")
+            import traceback
+            traceback.print_exc()
+            await asyncio.sleep(0.1)
+
+
+@app.get("/queue_status")
+async def queue_status():
+    """Get current queue status"""
+    return {
+        "queue_size": request_queue.qsize(),
+        "is_processing": is_processing,
+        "max_queue_size": request_queue.maxsize
+    }
+
+@app.get("/")
+async def health_check():
+    """Health check endpoint with feature list"""
+    return {
+        "status": "online",
+        "model": "whisper-base + Google STT Streaming",
+        "products_loaded": len(product_manager.pcode_list),
+        "queue_size": request_queue.qsize(),
+        "is_processing": is_processing,
+        "features": [
+            "🆕 Complete space removal before processing (35283 25 → 3528325)",
+            "🆕 Direct pcode+qty extraction without 'piece' keyword",
+            "🆕 Invalid pcode detection with user feedback",
+            "✅ Quantity follow-up: Say pcode first, then qty separately",
+            "✅ Real-time streaming via /stream_google WebSocket",
+            "✅ Stop Word Mode with cancel support",
+            "✅ Numeric product code detection"
+        ]
+    }
+
+@app.on_event("startup")
+async def startup_event():
+    """Start background worker on server startup"""
+    global model, request_queue, processing_lock, is_processing
+
+    try:
+        print("🔄 Loading Whisper model...")
+        model = whisper.load_model("base")
+        print("✅ Whisper model loaded successfully")
+    except Exception as e:
+        print(f"⚠️ Warning: Could not load Whisper model: {e}")
+        print("   Whisper transcription will not be available")
+
+    asyncio.create_task(process_audio_worker())
+    print("🚀 Background audio processing worker started")
+
+if __name__ == "__main__":
+    print("🚀 Starting Speech-to-Text Server with STREAMING SUPPORT")
+    print(f"📦 Loaded {len(product_manager.pcode_list)} product codes")
+    print("\n✨ FIXED FEATURES:")
+    print("   🔧 Complete space removal (35283 25 → 3528325)")
+    print("   🎯 Direct extraction without 'piece' keyword")
+    print("   ⚠️  Invalid pcode feedback to user")
+    print("   🔢 Quantity follow-up support")
+    print("\n✨ Server ready on http://0.0.0.0:5000\n")
+    uvicorn.run(app, host="0.0.0.0", port=5000)
