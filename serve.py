@@ -23,7 +23,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 DEEPGRAM_KEY_PATH = r"C:\Users\itintern2\Desktop\one\one\service\keys\deepgram.key"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-GOOGLE_KEY_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "service/keys/google_key.json")
+GOOGLE_KEY_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "google_key.json")
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = GOOGLE_KEY_PATH
 
 
