@@ -1,6 +1,5 @@
 from fastapi import FastAPI, UploadFile, BackgroundTasks, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
-import whisper
 import uvicorn
 import tempfile
 import os
@@ -1428,7 +1427,6 @@ async def health_check():
     """Health check endpoint with feature list"""
     return {
         "status": "online",
-        "model": "whisper-base + Google STT Streaming",
         "products_loaded": len(product_manager.pcode_list),
         "queue_size": request_queue.qsize(),
         "is_processing": is_processing,
