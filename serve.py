@@ -21,14 +21,13 @@ import contextlib
 from concurrent.futures import ThreadPoolExecutor
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
 if os.environ.get("GOOGLE_CREDENTIALS_JSON"):
-    print("🔐 Using GOOGLE_CREDENTIALS_JSON from Render")
+    print("🔐 Using GOOGLE_CREDENTIALS_JSON from environment (Render)")
     with open("gcloud_key.json", "w") as f:
         f.write(os.environ["GOOGLE_CREDENTIALS_JSON"])
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "gcloud_key.json"
 else:
-    print("🖥️ Using local service/keys/google_credentials.json")
+    print("🖥️ Using local google_credentials.json")
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.join(
         BASE_DIR, "service", "keys", "google_credentials.json"
     )
@@ -252,7 +251,7 @@ async def stream_google(websocket: WebSocket):
 
                         # Apply first letter lock before finalizing
                         if buffered_text:
-                            buffered_text, possible_codes = apply_first_letter_lock(buffered_text, session_state)
+                            buffered_text, possible_codes_result = apply_first_letter_lock(buffered_text, session_state)
 
                         # Finalize the buffered text
                         if buffered_text and len(buffered_text.strip()) >= 3:
@@ -263,7 +262,7 @@ async def stream_google(websocket: WebSocket):
                                 buffered_text,
                                 raw_original_text=buffered_text,
                                 session_state=session_state,
-                                possible_codes=possible_codes  # 🔥 NEW: Pass possible codes
+                                possible_codes=possible_codes_result
                             )
 
                             # 🔥 CRITICAL FIX: Handle response properly
@@ -318,7 +317,7 @@ async def stream_google(websocket: WebSocket):
                         continue
 
                     # Apply first letter lock to final transcript
-                    transcript_clean, possible_codes = apply_first_letter_lock(transcript_clean, session_state)
+                    transcript_clean, possible_codes_result = apply_first_letter_lock(transcript_clean, session_state)
 
                     # Process final result
                     if result.is_final:
@@ -329,7 +328,7 @@ async def stream_google(websocket: WebSocket):
                             transcript_clean,
                             raw_original_text=transcript_clean,
                             session_state=session_state,
-                            possible_codes=possible_codes  # 🔥 NEW: Pass possible codes
+                            possible_codes=possible_codes_result
                         )
 
                         # 🔥 CRITICAL FIX: Handle response properly
@@ -515,7 +514,8 @@ def handle_processed_result(processed: Dict, session_state: SessionState, safe_t
 def apply_first_letter_lock(transcript: str, session_state: SessionState) -> tuple:
     """
     🔒 Apply first letter lock to the FIRST WORD before joining
-    Returns: (corrected_transcript, list_of_possible_codes or None)
+    🔥 FIXED: Returns (corrected_transcript, dict_or_None) instead of (transcript, list)
+    Returns: (corrected_transcript, {'options': [...], 'qty': '...'} or None)
     """
     if not transcript:
         return transcript, None
@@ -554,7 +554,7 @@ def apply_first_letter_lock(transcript: str, session_state: SessionState) -> tup
             transcript_cleaned = ' '.join(words)
             print(f"🔒 APPLIED FIRST LETTER LOCK: '{transcript_stripped}' → '{transcript_cleaned}'")
 
-    # Check for '8' or '3' prefix fallback
+    # 🔥 FIXED: Check for '8' or '3' prefix fallback - return dict with options and qty
     if transcript_cleaned and (transcript_cleaned[0] == '8' or transcript_cleaned[0] == '3'):
         transcript_no_space = transcript_cleaned.replace(' ', '')
 
@@ -570,8 +570,14 @@ def apply_first_letter_lock(transcript: str, session_state: SessionState) -> tup
                 real_candidate = "3" + suffix
                 if product_manager.exists(real_candidate):
                     print(f"✅ REAL MATCH DETECTED: {real_candidate}")
-                    return real_candidate + remaining, None
-                # If not found → fall-through to letter search
+                    # Extract qty from remaining if present
+                    qty = ""
+                    if remaining:
+                        digits_only = re.sub(r'\D', '', remaining)
+                        if digits_only and 1 <= int(digits_only) <= 9999:
+                            qty = digits_only
+                    # Return as single option with qty
+                    return real_candidate + (remaining if not qty else ""), {'options': [real_candidate], 'qty': qty}
 
             # -----------------------------
             # CASE 2: Prefix is '8' OR fallback for '3'
@@ -587,17 +593,25 @@ def apply_first_letter_lock(transcript: str, session_state: SessionState) -> tup
                     print(f"  ✓ Match: {candidate}")
 
             if possible:
+                # 🔥 FIXED: Extract quantity from remaining digits
+                qty = ""
+                if remaining:
+                    digits_only = re.sub(r'\D', '', remaining)
+                    if digits_only and 1 <= int(digits_only) <= 9999:
+                        qty = digits_only
+                        print(f"📦 MULTIPLE OPTIONS + QTY: {qty}")
+
                 if len(possible) == 1:
-                    final_code = possible[0] + remaining
+                    final_code = possible[0] + (remaining if not qty else "")
                     print(f"🔁 PREFIX FIXED USING LETTER DICTIONARY: {final_code}")
-                    return final_code, None
+                    return final_code, {'options': possible, 'qty': qty}
                 else:
                     print(f"🔀 Multiple matches: {possible}")
-                    return possible[0], possible  # default & list
+                    # 🔥 FIXED: Return dict with options and extracted qty
+                    return possible[0], {'options': possible, 'qty': qty}
 
     # No correction applied
     return transcript_cleaned, None
-
 
 
 class ProductListManager:
@@ -880,9 +894,9 @@ class TranscriptionPipeline:
     """Complete processing pipeline with proper qty follow-up logic"""
 
     @staticmethod
-    def process(raw_text: str, raw_original_text: Optional[str] = None, session_state=None, possible_codes: List[str] = None) -> Dict:
+    def process(raw_text: str, raw_original_text: Optional[str] = None, session_state=None, possible_codes=None) -> Dict:
         """
-        🔥 ENHANCED: Now accepts possible_codes parameter for ambiguous matches
+        🔥 ENHANCED: Now accepts possible_codes parameter (dict or None)
         """
         print(f"\n{'=' * 70}")
 
@@ -897,7 +911,7 @@ class TranscriptionPipeline:
                 "qty": "",
                 "confidence": 0.0,
                 "is_qty_followup": False,
-                "possible_codes": []  # 🔥 NEW
+                "possible_codes": []
             }
 
         if not raw_text.strip() or raw_text.strip() in ['.', ',', '!', '?', '...']:
@@ -911,7 +925,7 @@ class TranscriptionPipeline:
                 "qty": "",
                 "confidence": 0.0,
                 "is_qty_followup": False,
-                "possible_codes": []  # 🔥 NEW
+                "possible_codes": []
             }
 
         try:
@@ -933,7 +947,7 @@ class TranscriptionPipeline:
                                 "qty": digits_only,
                                 "confidence": 1.0,
                                 "is_qty_followup": True,
-                                "possible_codes": []  # 🔥 NEW
+                                "possible_codes": []
                             }
                     except:
                         pass
@@ -942,7 +956,7 @@ class TranscriptionPipeline:
             normalized = UltraTextProcessor.process(raw_text, product_manager)
             original_for_processing = raw_text if raw_original_text is None else raw_original_text
 
-            # 🔥 CRITICAL: Pass possible_codes to extractor
+            # 🔥 CRITICAL FIX: Handle possible_codes as dict or None
             candidates = SmartExtractor.extract(normalized, product_manager, possible_codes=possible_codes)
 
             if candidates:
@@ -951,11 +965,14 @@ class TranscriptionPipeline:
                     best_pcode, best_qty, product_manager
                 )
 
-                # 🔥 NEW: Check if we have multiple options from possible_codes
+                # 🔥 NEW: Check if we have multiple options from possible_codes dict
                 final_possible_codes = []
-                if possible_codes and len(possible_codes) > 1:
-                    final_possible_codes = possible_codes
-                    print(f"🔀 RETURNING MULTIPLE OPTIONS: {final_possible_codes}")
+                if possible_codes and isinstance(possible_codes, dict) and 'options' in possible_codes:
+                    final_possible_codes = possible_codes['options']
+                    # Use qty from dict if not already extracted
+                    if not final_qty and possible_codes.get('qty'):
+                        final_qty = possible_codes['qty']
+                    print(f"🔀 RETURNING MULTIPLE OPTIONS: {final_possible_codes} with qty: {final_qty}")
 
                 print(f"✅ FINAL -> Product: {final_pcode or 'NO MATCH'} | Qty: {final_qty or 'N/A'}")
                 print(f"📊 Confidence: {final_conf}")
@@ -969,7 +986,7 @@ class TranscriptionPipeline:
                     "qty": final_qty,
                     "confidence": round(final_conf, 2),
                     "is_qty_followup": False,
-                    "possible_codes": final_possible_codes  # 🔥 NEW
+                    "possible_codes": final_possible_codes
                 }
             else:
                 print(f"❌ NO MATCH FOUND")
@@ -982,7 +999,7 @@ class TranscriptionPipeline:
                     "qty": "",
                     "confidence": 0.0,
                     "is_qty_followup": False,
-                    "possible_codes": []  # 🔥 NEW
+                    "possible_codes": []
                 }
 
         except Exception as e:
@@ -999,38 +1016,31 @@ class TranscriptionPipeline:
                 "qty": "",
                 "confidence": 0.0,
                 "is_qty_followup": False,
-                "possible_codes": []  # 🔥 NEW
+                "possible_codes": []
             }
 
 
 class SmartExtractor:
     @staticmethod
-    def extract(text: str, product_manager: ProductListManager, possible_codes: List[str] = None) -> List[Tuple[str, str, float]]:
+    def extract(text: str, product_manager: ProductListManager, possible_codes=None) -> List[Tuple[str, str, float]]:
         """
-        🔥 ENHANCED: Now accepts possible_codes for ambiguous matches
+        🔥 ENHANCED: Now accepts possible_codes as dict or None
         """
         text_no_space = text.replace(' ', '').lower()
         print(f"  🔧 Text (spaces removed): '{text_no_space}'")
 
-        # 🔥 NEW: If we already have possible_codes from prefix correction, extract qty and return
-        if possible_codes and len(possible_codes) > 1:
-            print(f"  🔀 USING PRE-DETERMINED OPTIONS: {possible_codes}")
+        # 🔥 NEW: If we already have possible_codes dict from prefix correction, extract qty and return
+        if possible_codes and isinstance(possible_codes, dict) and 'options' in possible_codes:
+            options = possible_codes['options']
+            qty_from_dict = possible_codes.get('qty', '')
 
-            # Try to extract quantity from the text
-            # First, try to find where the pcode ends by checking against the first option
-            first_option = possible_codes[0].lower()
-            qty = ""
+            print(f"  🔀 USING PRE-DETERMINED OPTIONS: {options}")
+            print(f"  📦 QTY FROM DICT: '{qty_from_dict}'")
 
-            if text_no_space.startswith(first_option):
-                remaining = text_no_space[len(first_option):]
-                digits_only = re.sub(r'\D', '', remaining)
-                if digits_only and 1 <= int(digits_only) <= 9999:
-                    qty = digits_only
-                    print(f"  ✅ EXTRACTED QTY FROM AMBIGUOUS: '{qty}'")
-
-            # Return the first option as the "primary" but frontend will handle all options
-            pcode = product_manager.get_exact_case(possible_codes[0])
-            return [(pcode, qty, 1.0 if qty else 0.95)]
+            # Use the first option as primary
+            if options:
+                pcode = product_manager.get_exact_case(options[0])
+                return [(pcode, qty_from_dict, 1.0 if qty_from_dict else 0.95)]
 
         # Try direct extraction
         for end_pos in range(5, min(len(text_no_space) + 1, 20)):
@@ -1431,7 +1441,7 @@ async def health_check():
         "queue_size": request_queue.qsize(),
         "is_processing": is_processing,
         "features": [
-            "🔥 FIXED: Ambiguous code handling with quantity follow-up",
+            "🔥 FIXED: Code + Qty together extraction (no repeat needed)",
             "✅ RULE 1: Ambiguous pcode = ALWAYS create entry immediately",
             "✅ RULE 2: Ambiguous + no qty = WAIT FOR QTY",
             "✅ RULE 3: Ambiguous + qty = finalize entry immediately",
@@ -1460,7 +1470,7 @@ async def startup_event():
 
 
 if __name__ == "__main__":
-    print("🚀 Starting Speech-to-Text Server - AMBIGUOUS CODE FIX")
+    print("🚀 Starting Speech-to-Text Server - CODE + QTY TOGETHER FIX")
     print(f"📦 Loaded {len(product_manager.pcode_list)} product codes")
     print("\n🔧 KEY FIXES:")
     print("   ✅ RULE 1: Ambiguous pcode = ALWAYS create entry immediately")
@@ -1468,6 +1478,7 @@ if __name__ == "__main__":
     print("   ✅ RULE 3: Ambiguous + qty = finalize entry immediately (no waiting)")
     print("   ✅ RULE 4: Selecting correct pcode later does NOT ask for qty again")
     print("   ✅ RULE 5: Normal single pcode flow remains unchanged")
+    print("   🔥 NEW: Code + Qty spoken together = both extracted immediately")
     print("\n🔒 EXISTING FEATURES:")
     print("   ✅ First letter lock replaces ENTIRE convertible words like 'is'")
     print("   ✅ A-Z dictionary fallback for unknown '8' prefixes")
