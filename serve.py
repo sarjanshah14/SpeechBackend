@@ -727,7 +727,8 @@ class UltraTextProcessor:
 
         # Replace letter spellings
         letter_variants = [
-            (r'\bhe is\b', 'e'),(r'\bhe\b', 'e'),(r"\bhe's\b", 'e'),(r'\bis\b', 'e'), (r'\bay\b', 'a'), (r'\bee\b', 'e'),
+            (r'\bhe is\b', 'e'),(r'\bhe\b', 'e'),(r"\bhe's\b", 'e'),
+            (r'\bis\b', 'e'), (r'\bay\b', 'a'), (r'\bee\b', 'e'),
             (r'\bsee\b', 'c'), (r'\bdee\b', 'd'), (r'\bef\b', 'f'),
             (r'\bgee\b', 'g'), (r'\baych\b', 'h'), (r'\bjay\b', 'j'),
             (r'\bkay\b', 'k'), (r'\bell\b', 'l'), (r'\bem\b', 'm'),
@@ -743,7 +744,7 @@ class UltraTextProcessor:
             (r'\bate\b', 'eight'), (r'\bait\b', 'eight'),
             (r'\bnein\b', 'nine'), (r'\btin\b', 'ten'), (r'\beven\b', 'E1'),
             (r'\bsaid\b', 'z'), (r'\btrip\b', 'triple'),
-            (r'\b1380\b', '13ed'), (r'\bdege\b', 'h'),(r'\bhi\b', 'i'),(r'\bnew\b', 'u'),
+            (r'\b1380\b', '13ed'), (r'\bedge\b', 'h'),(r'\bhi\b', 'i'),(r'\bnew\b', 'u'),(r'\bjet\b', 'z'),(r'\bhave fun\b', 'f1'),
         ]
 
         # First pass: replace with word boundaries
@@ -791,7 +792,7 @@ class UltraTextProcessor:
         for word, replacement in number_word_replacements.items():
             text = re.sub(r'\b' + word + r'\b', replacement, text, flags=re.IGNORECASE)
 
-        number_words = r"(?:zero|oh|o|one|two|2|three|four|4|five|six|seven|eight|8|nine)"
+        number_words = r"(?:zero|oh|o|one|1|two|2|three|3|four|4|five|5|six|5|seven|7|eight|8|nine|9)"
         max_iterations = 20
 
         for iteration in range(max_iterations):
@@ -1052,7 +1053,7 @@ class SmartExtractor:
 
                 if remaining:
                     digits_only = re.sub(r'\D', '', remaining)
-                    if digits_only and 1 <= int(digits_only) <= 9999:
+                    if digits_only and 1 <= int(digits_only) <= 99999:
                         qty = digits_only
 
                 pcode = product_manager.get_exact_case(pcode_candidate)
