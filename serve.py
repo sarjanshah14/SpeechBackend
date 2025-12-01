@@ -1,5 +1,6 @@
 from fastapi import FastAPI, UploadFile, BackgroundTasks, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
+import whisper
 import uvicorn
 import tempfile
 import os
@@ -31,7 +32,6 @@ else:
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.join(
         BASE_DIR, "service", "keys", "google_credentials.json"
     )
-
 
 app = FastAPI()
 
@@ -97,14 +97,22 @@ async def stream_google(websocket: WebSocket):
             phrase_sets=[
                 gspeech.PhraseSet(
                     phrases=[
-                        gspeech.PhraseSet.Phrase(value="double", boost=25),
-                        gspeech.PhraseSet.Phrase(value="triple", boost=25),
+                        gspeech.PhraseSet.Phrase(value="double", boost=50),
+                        gspeech.PhraseSet.Phrase(value="triple", boost=50),
                         *[
                             gspeech.PhraseSet.Phrase(value=f"double {i}", boost=25)
                             for i in range(10)
                         ],
                         *[
                             gspeech.PhraseSet.Phrase(value=f"triple {i}", boost=25)
+                            for i in range(10)
+                        ],
+                        *[
+                            gspeech.PhraseSet.Phrase(value=f"double{i}", boost=25)
+                            for i in range(10)
+                        ],
+                        *[
+                            gspeech.PhraseSet.Phrase(value=f"triple{i}", boost=25)
                             for i in range(10)
                         ],
                     ]
@@ -192,9 +200,12 @@ async def stream_google(websocket: WebSocket):
                             len(transcript_minimal) == 1 and
                             transcript_minimal[0].isalpha() and
                             not session_state.first_letter_lock):
-                        common_words_to_convert = ['and', 'an', 'high','hi','is', 'he', 'ay', 'bee', 'see', 'dee',
-                                                   'ef', 'gee', 'jay', 'kay', 'ell', 'em', 'en', 'oh', 'pea',
-                                                   'queue', 'ar', 'ess', 'tea', 'you', 'vee', 'ex', 'why', 'zee']
+                        common_words_to_convert = ['and', 'an', 'high', 'hi', 'is', 'he', 'ay',
+                                                   'bee', 'see', 'dee',
+                                                   'ef', 'gee', 'jay', 'kay', 'ell', 'em', 'en',
+                                                   'oh', 'pea',
+                                                   'queue', 'ar', 'ess', 'tea', 'you', 'vee', 'ex',
+                                                   'why', 'zee']
                         if transcript_minimal not in common_words_to_convert:
                             session_state.first_letter_lock = transcript_minimal[0].upper()
                             print(f"🔒 FIRST LETTER LOCKED: {session_state.first_letter_lock}")
@@ -212,7 +223,8 @@ async def stream_google(websocket: WebSocket):
 
                     if cancel_word_found:
                         if result.is_final:
-                            print(f"🔄 CANCEL WORD DETECTED ('{cancel_word_found}'): Discarding buffer and resetting")
+                            print(
+                                f"🔄 CANCEL WORD DETECTED ('{cancel_word_found}'): Discarding buffer and resetting")
                             buffered_text = ""
                             safe_thread_send({
                                 "type": "cancelled",
@@ -251,11 +263,13 @@ async def stream_google(websocket: WebSocket):
 
                         # Apply first letter lock before finalizing
                         if buffered_text:
-                            buffered_text, possible_codes_result = apply_first_letter_lock(buffered_text, session_state)
+                            buffered_text, possible_codes_result = apply_first_letter_lock(
+                                buffered_text, session_state)
 
                         # Finalize the buffered text
                         if buffered_text and len(buffered_text.strip()) >= 3:
-                            print(f"🛑 STOP WORD DETECTED ('{stop_word_found}'): Finalizing buffer: {buffered_text}")
+                            print(
+                                f"🛑 STOP WORD DETECTED ('{stop_word_found}'): Finalizing buffer: {buffered_text}")
 
                             # 🔥 CRITICAL FIX: Process with session state
                             processed = TranscriptionPipeline.process(
@@ -266,7 +280,8 @@ async def stream_google(websocket: WebSocket):
                             )
 
                             # 🔥 CRITICAL FIX: Handle response properly
-                            handle_processed_result(processed, session_state, safe_thread_send, buffered_text)
+                            handle_processed_result(processed, session_state, safe_thread_send,
+                                                    buffered_text)
                             buffered_text = ""
                     else:
                         # No stop/cancel word: accumulate in buffer
@@ -297,7 +312,8 @@ async def stream_google(websocket: WebSocket):
                             break
 
                     if cancel_word_found:
-                        print(f"🔄 CANCEL WORD DETECTED ('{cancel_word_found}'): Ignoring this transcription")
+                        print(
+                            f"🔄 CANCEL WORD DETECTED ('{cancel_word_found}'): Ignoring this transcription")
                         safe_thread_send({
                             "type": "cancelled",
                             "message": f"Transcription cancelled. Say the product code again.",
@@ -317,7 +333,8 @@ async def stream_google(websocket: WebSocket):
                         continue
 
                     # Apply first letter lock to final transcript
-                    transcript_clean, possible_codes_result = apply_first_letter_lock(transcript_clean, session_state)
+                    transcript_clean, possible_codes_result = apply_first_letter_lock(
+                        transcript_clean, session_state)
 
                     # Process final result
                     if result.is_final:
@@ -332,7 +349,8 @@ async def stream_google(websocket: WebSocket):
                         )
 
                         # 🔥 CRITICAL FIX: Handle response properly
-                        handle_processed_result(processed, session_state, safe_thread_send, transcript_clean)
+                        handle_processed_result(processed, session_state, safe_thread_send,
+                                                transcript_clean)
 
         except Exception as e:
             print(f"❌ Error in process_responses: {e}")
@@ -350,11 +368,13 @@ async def stream_google(websocket: WebSocket):
         while True:
             message = await websocket.receive()
             data_bytes = message.get("bytes")
+
             text = message.get("text")
 
             if data_bytes is not None:
                 q.put(data_bytes)
-                print(f"📥 Received {len(data_bytes)} bytes of audio")
+                # print(f"📥 Received {len(data_bytes)} bytes of audio")
+                print("🔍 FIRST BYTES:", data_bytes[:20])
             elif text is not None:
                 try:
                     payload = json.loads(text)
@@ -400,7 +420,8 @@ async def stream_google(websocket: WebSocket):
             print(f"⚠️ WebSocket close warning: {e}")
 
 
-def handle_processed_result(processed: Dict, session_state: SessionState, safe_thread_send, transcript: str):
+def handle_processed_result(processed: Dict, session_state: SessionState, safe_thread_send,
+                            transcript: str):
     """
     🔥 NEW FUNCTION: Centralized handler for all processing results
     Implements the 5 rules for ambiguous code handling
@@ -545,23 +566,27 @@ def apply_first_letter_lock(transcript: str, session_state: SessionState) -> tup
 
             if len(words) > 1 and is_pure_letters(first_word):
                 words[0] = session_state.first_letter_lock
-                print(f"🔧 REPLACED FIRST WORD: '{first_word}' → '{session_state.first_letter_lock}' (pure letters word)")
+                print(
+                    f"🔧 REPLACED FIRST WORD: '{first_word}' → '{session_state.first_letter_lock}' (pure letters word)")
             else:
                 if len(first_word) > 0:
                     words[0] = session_state.first_letter_lock + first_word[1:]
-                    print(f"🔧 REPLACED FIRST CHAR: '{first_word}' → '{words[0]}' (contains digits or single word)")
+                    print(
+                        f"🔧 REPLACED FIRST CHAR: '{first_word}' → '{words[0]}' (contains digits or single word)")
 
             transcript_cleaned = ' '.join(words)
             print(f"🔒 APPLIED FIRST LETTER LOCK: '{transcript_stripped}' → '{transcript_cleaned}'")
 
     # 🔥 FIXED: Check for '8' or '3' prefix fallback - return dict with options and qty
-    if transcript_cleaned and (transcript_cleaned[0] == '8' or transcript_cleaned[0] == '3'):
+    if transcript_cleaned and (
+            transcript_cleaned[0] == '8' or transcript_cleaned[0] == '3' or transcript_cleaned[
+        0] == '0' or transcript_cleaned[0] == '9'):
         transcript_no_space = transcript_cleaned.replace(' ', '')
 
         if len(transcript_no_space) >= 5:
             prefix = transcript_no_space[0]
-            suffix = transcript_no_space[1:5]        # 4-digit part
-            remaining = transcript_no_space[5:]      # qty or extra text
+            suffix = transcript_no_space[1:5]  # 4-digit part
+            remaining = transcript_no_space[5:]  # qty or extra text
 
             # -----------------------------
             # CASE 1: Prefix is '3' → try real product 3XXXX first
@@ -577,7 +602,8 @@ def apply_first_letter_lock(transcript: str, session_state: SessionState) -> tup
                         if digits_only and 1 <= int(digits_only) <= 9999:
                             qty = digits_only
                     # Return as single option with qty
-                    return real_candidate + (remaining if not qty else ""), {'options': [real_candidate], 'qty': qty}
+                    return real_candidate + (remaining if not qty else ""), {
+                        'options': [real_candidate], 'qty': qty}
 
             # -----------------------------
             # CASE 2: Prefix is '8' OR fallback for '3'
@@ -727,7 +753,8 @@ class UltraTextProcessor:
 
         # Replace letter spellings
         letter_variants = [
-            (r'\bhe is\b', 'e'),(r'\bhe\b', 'e'),(r"\bhe's\b", 'e'),
+            (r'\bis there\b', 'z'), (r'\bis that\b', 'z'),
+            (r'\bhe is\b', 'e'), (r'\bhe\b', 'e'), (r"\bhe's\b", 'e'),
             (r'\bis\b', 'e'), (r'\bay\b', 'a'), (r'\bee\b', 'e'),
             (r'\bsee\b', 'c'), (r'\bdee\b', 'd'), (r'\bef\b', 'f'),
             (r'\bgee\b', 'g'), (r'\baych\b', 'h'), (r'\bjay\b', 'j'),
@@ -744,7 +771,9 @@ class UltraTextProcessor:
             (r'\bate\b', 'eight'), (r'\bait\b', 'eight'),
             (r'\bnein\b', 'nine'), (r'\btin\b', 'ten'), (r'\beven\b', 'E1'),
             (r'\bsaid\b', 'z'), (r'\btrip\b', 'triple'),
-            (r'\b1380\b', '13ed'), (r'\bedge\b', 'h'),(r'\bhi\b', 'i'),(r'\bnew\b', 'u'),(r'\bjet\b', 'z'),(r'\bhave fun\b', 'f1'),
+            (r'\b1380\b', '13ed'), (r'\bedge\b', 'h'), (r'\bhi\b', 'i'), (r'\bnew\b', 'u'),
+            (r'\bjet\b', 'z'),
+            (r'\bhave fun\b', 'f1'),
         ]
 
         # First pass: replace with word boundaries
@@ -758,7 +787,7 @@ class UltraTextProcessor:
             'jay': 'j', 'kay': 'k', 'ell': 'l', 'em': 'm', 'en': 'n',
             'oh': 'o', 'pea': 'p', 'queue': 'q', 'ar': 'r', 'ess': 's',
             'tea': 't', 'you': 'u', 'vee': 'v', 'ex': 'x', 'why': 'y',
-            'zed': 'z', 'zee': 'z'
+            'zed': 'z', 'zee': 'z', 'said': 'z',
         }
 
         for word, replacement in joined_word_replacements.items():
@@ -792,7 +821,7 @@ class UltraTextProcessor:
         for word, replacement in number_word_replacements.items():
             text = re.sub(r'\b' + word + r'\b', replacement, text, flags=re.IGNORECASE)
 
-        number_words = r"(?:zero|oh|o|one|1|two|2|three|3|four|4|five|5|six|5|seven|7|eight|8|nine|9)"
+        number_words = r"(?:zero|oh|o|one|two|2|three|four|4|five|six|seven|eight|8|nine)"
         max_iterations = 20
 
         for iteration in range(max_iterations):
@@ -814,15 +843,21 @@ class UltraTextProcessor:
             text = re.sub(r'([a-z0-9])(double|triple)', r'\1 \2', text, flags=re.IGNORECASE)
             text = re.sub(r'\bdouble\s*(\d)', lambda m: m.group(1) * 2, text, flags=re.IGNORECASE)
             text = re.sub(r'\btriple\s*(\d)', lambda m: m.group(1) * 3, text, flags=re.IGNORECASE)
-            text = re.sub(r'\bdouble\s*([a-z])', lambda m: m.group(1).lower() * 2, text, flags=re.IGNORECASE)
-            text = re.sub(r'\btriple\s*([a-z])', lambda m: m.group(1).lower() * 3, text, flags=re.IGNORECASE)
-            text = re.sub(r'\bdouble(\d{2,})', lambda m: m.group(1)[0] * 2 + m.group(1)[1:], text, flags=re.IGNORECASE)
-            text = re.sub(r'\btriple(\d{2,})', lambda m: m.group(1)[0] * 3 + m.group(1)[1:], text, flags=re.IGNORECASE)
+            text = re.sub(r'\bdouble\s*([a-z])', lambda m: m.group(1).lower() * 2, text,
+                          flags=re.IGNORECASE)
+            text = re.sub(r'\btriple\s*([a-z])', lambda m: m.group(1).lower() * 3, text,
+                          flags=re.IGNORECASE)
+            text = re.sub(r'\bdouble(\d{2,})', lambda m: m.group(1)[0] * 2 + m.group(1)[1:], text,
+                          flags=re.IGNORECASE)
+            text = re.sub(r'\btriple(\d{2,})', lambda m: m.group(1)[0] * 3 + m.group(1)[1:], text,
+                          flags=re.IGNORECASE)
 
             if 'double' in text.lower():
-                text = re.sub(r'double\s*([a-z0-9])', lambda m: m.group(1) * 2, text, flags=re.IGNORECASE)
+                text = re.sub(r'double\s*([a-z0-9])', lambda m: m.group(1) * 2, text,
+                              flags=re.IGNORECASE)
             if 'triple' in text.lower():
-                text = re.sub(r'triple\s*([a-z0-9])', lambda m: m.group(1) * 3, text, flags=re.IGNORECASE)
+                text = re.sub(r'triple\s*([a-z0-9])', lambda m: m.group(1) * 3, text,
+                              flags=re.IGNORECASE)
 
             if text == original:
                 break
@@ -895,7 +930,8 @@ class TranscriptionPipeline:
     """Complete processing pipeline with proper qty follow-up logic"""
 
     @staticmethod
-    def process(raw_text: str, raw_original_text: Optional[str] = None, session_state=None, possible_codes=None) -> Dict:
+    def process(raw_text: str, raw_original_text: Optional[str] = None, session_state=None,
+                possible_codes=None) -> Dict:
         """
         🔥 ENHANCED: Now accepts possible_codes parameter (dict or None)
         """
@@ -932,14 +968,16 @@ class TranscriptionPipeline:
         try:
             # Check for quantity follow-up
             if session_state and session_state.is_waiting():
-                normalized_for_qty = UltraTextProcessor.process(raw_text, product_manager=product_manager)
+                normalized_for_qty = UltraTextProcessor.process(raw_text,
+                                                                product_manager=product_manager)
                 digits_only = re.sub(r'\D', '', normalized_for_qty)
 
                 if digits_only:
                     try:
                         qty_val = int(digits_only)
                         if 1 <= qty_val <= 9999:
-                            print(f"🔢 QUANTITY FOLLOW-UP: '{digits_only}' (waiting for {session_state.last_pcode})")
+                            print(
+                                f"🔢 QUANTITY FOLLOW-UP: '{digits_only}' (waiting for {session_state.last_pcode})")
                             return {
                                 "raw_text": raw_text.strip(),
                                 "normalized": normalized_for_qty,
@@ -958,7 +996,8 @@ class TranscriptionPipeline:
             original_for_processing = raw_text if raw_original_text is None else raw_original_text
 
             # 🔥 CRITICAL FIX: Handle possible_codes as dict or None
-            candidates = SmartExtractor.extract(normalized, product_manager, possible_codes=possible_codes)
+            candidates = SmartExtractor.extract(normalized, product_manager,
+                                                possible_codes=possible_codes)
 
             if candidates:
                 best_pcode, best_qty, conf = candidates[0]
@@ -968,14 +1007,17 @@ class TranscriptionPipeline:
 
                 # 🔥 NEW: Check if we have multiple options from possible_codes dict
                 final_possible_codes = []
-                if possible_codes and isinstance(possible_codes, dict) and 'options' in possible_codes:
+                if possible_codes and isinstance(possible_codes,
+                                                 dict) and 'options' in possible_codes:
                     final_possible_codes = possible_codes['options']
                     # Use qty from dict if not already extracted
                     if not final_qty and possible_codes.get('qty'):
                         final_qty = possible_codes['qty']
-                    print(f"🔀 RETURNING MULTIPLE OPTIONS: {final_possible_codes} with qty: {final_qty}")
+                    print(
+                        f"🔀 RETURNING MULTIPLE OPTIONS: {final_possible_codes} with qty: {final_qty}")
 
-                print(f"✅ FINAL -> Product: {final_pcode or 'NO MATCH'} | Qty: {final_qty or 'N/A'}")
+                print(
+                    f"✅ FINAL -> Product: {final_pcode or 'NO MATCH'} | Qty: {final_qty or 'N/A'}")
                 print(f"📊 Confidence: {final_conf}")
                 print(f"{'=' * 70}\n")
 
@@ -1023,7 +1065,8 @@ class TranscriptionPipeline:
 
 class SmartExtractor:
     @staticmethod
-    def extract(text: str, product_manager: ProductListManager, possible_codes=None) -> List[Tuple[str, str, float]]:
+    def extract(text: str, product_manager: ProductListManager, possible_codes=None) -> List[
+        Tuple[str, str, float]]:
         """
         🔥 ENHANCED: Now accepts possible_codes as dict or None
         """
@@ -1053,7 +1096,7 @@ class SmartExtractor:
 
                 if remaining:
                     digits_only = re.sub(r'\D', '', remaining)
-                    if digits_only and 1 <= int(digits_only) <= 99999:
+                    if digits_only and 1 <= int(digits_only) <= 9999:
                         qty = digits_only
 
                 pcode = product_manager.get_exact_case(pcode_candidate)
@@ -1110,7 +1153,8 @@ class SmartExtractor:
                         'type': 'exact',
                         'priority': 1
                     })
-                    print(f"  🎯 Found exact match candidate: '{candidate}' with remaining: '{remaining}'")
+                    print(
+                        f"  🎯 Found exact match candidate: '{candidate}' with remaining: '{remaining}'")
 
             if candidates:
                 candidates.sort(key=lambda x: len(x['pcode']))
@@ -1120,7 +1164,8 @@ class SmartExtractor:
                 best_match_end_pos = best_candidate['end_pos']
                 remaining = best_candidate['remaining']
 
-                print(f"  ✅ Selected shortest exact match: '{best_match}' (from {len(candidates)} candidates)")
+                print(
+                    f"  ✅ Selected shortest exact match: '{best_match}' (from {len(candidates)} candidates)")
 
                 if remaining:
                     digits_only = re.sub(r'\D', '', remaining)
@@ -1305,7 +1350,8 @@ class CharacterConfusionCorrector:
                         tried_combinations.add(variant)
                         if product_manager.exists(variant):
                             candidates.append(variant)
-                            print(f"  🔧 Single char correction: '{pcode}' → '{variant}' (position {i}: '{char}'→'{similar}')")
+                            print(
+                                f"  🔧 Single char correction: '{pcode}' → '{variant}' (position {i}: '{char}'→'{similar}')")
 
         if not candidates and len(pcode) >= 3:
             for i in range(min(3, len(pcode))):
@@ -1318,20 +1364,23 @@ class CharacterConfusionCorrector:
                             char2 = variant1[j].lower()
                             if char2 in UltraTextProcessor.SIMILAR_CHARS:
                                 for similar2 in UltraTextProcessor.SIMILAR_CHARS[char2]:
-                                    variant2 = variant1[:j].lower() + similar2 + variant1[j + 1:].lower()
+                                    variant2 = variant1[:j].lower() + similar2 + variant1[
+                                                                                 j + 1:].lower()
 
                                     if variant2 not in tried_combinations:
                                         tried_combinations.add(variant2)
                                         if product_manager.exists(variant2):
                                             candidates.append(variant2)
-                                            print(f"  🔧 Double char correction: '{pcode}' → '{variant2}' (positions {i},{j})")
+                                            print(
+                                                f"  🔧 Double char correction: '{pcode}' → '{variant2}' (positions {i},{j})")
 
         return candidates if candidates else []
 
 
 class FinalValidator:
     @staticmethod
-    def validate(pcode: str, qty: str, product_manager: ProductListManager) -> Tuple[str, str, float]:
+    def validate(pcode: str, qty: str, product_manager: ProductListManager) -> Tuple[
+        str, str, float]:
         qty_clean = re.sub(r'\D', '', qty) if qty else ""
 
         if qty_clean:
@@ -1438,6 +1487,7 @@ async def health_check():
     """Health check endpoint with feature list"""
     return {
         "status": "online",
+        "model": "whisper-base + Google STT Streaming",
         "products_loaded": len(product_manager.pcode_list),
         "queue_size": request_queue.qsize(),
         "is_processing": is_processing,
@@ -1470,21 +1520,21 @@ async def startup_event():
     print("🚀 Background audio processing worker started")
 
 
-# if __name__ == "__main__":
-#     print("🚀 Starting Speech-to-Text Server - CODE + QTY TOGETHER FIX")
-#     print(f"📦 Loaded {len(product_manager.pcode_list)} product codes")
-#     print("\n🔧 KEY FIXES:")
-#     print("   ✅ RULE 1: Ambiguous pcode = ALWAYS create entry immediately")
-#     print("   ✅ RULE 2: Ambiguous + no qty = WAIT FOR QTY (link next quantity)")
-#     print("   ✅ RULE 3: Ambiguous + qty = finalize entry immediately (no waiting)")
-#     print("   ✅ RULE 4: Selecting correct pcode later does NOT ask for qty again")
-#     print("   ✅ RULE 5: Normal single pcode flow remains unchanged")
-#     print("   🔥 NEW: Code + Qty spoken together = both extracted immediately")
-#     print("\n🔒 EXISTING FEATURES:")
-#     print("   ✅ First letter lock replaces ENTIRE convertible words like 'is'")
-#     print("   ✅ A-Z dictionary fallback for unknown '8' prefixes")
-#     print("   ✅ Character confusion correction (P→E/B/F sound-alike substitution)")
-#     print("   ✅ Double/Triple works for ALL numbers (1-9), not just 0")
-#     print("   ✅ Handles 'K0 double 5 9' correctly -> 'K0559'")
-#     print("\n✨ Server ready on http://0.0.0.0:5000\n")
-#     uvicorn.run(app, host="0.0.0.0", port=5000)
+if __name__ == "__main__":
+    print("🚀 Starting Speech-to-Text Server - CODE + QTY TOGETHER FIX")
+    print(f"📦 Loaded {len(product_manager.pcode_list)} product codes")
+    print("\n🔧 KEY FIXES:")
+    print("   ✅ RULE 1: Ambiguous pcode = ALWAYS create entry immediately")
+    print("   ✅ RULE 2: Ambiguous + no qty = WAIT FOR QTY (link next quantity)")
+    print("   ✅ RULE 3: Ambiguous + qty = finalize entry immediately (no waiting)")
+    print("   ✅ RULE 4: Selecting correct pcode later does NOT ask for qty again")
+    print("   ✅ RULE 5: Normal single pcode flow remains unchanged")
+    print("   🔥 NEW: Code + Qty spoken together = both extracted immediately")
+    print("\n🔒 EXISTING FEATURES:")
+    print("   ✅ First letter lock replaces ENTIRE convertible words like 'is'")
+    print("   ✅ A-Z dictionary fallback for unknown '8' prefixes")
+    print("   ✅ Character confusion correction (P→E/B/F sound-alike substitution)")
+    print("   ✅ Double/Triple works for ALL numbers (1-9), not just 0")
+    print("   ✅ Handles 'K0 double 5 9' correctly -> 'K0559'")
+    print("\n✨ Server ready on http://0.0.0.0:5000\n")
+    uvicorn.run(app, host="0.0.0.0", port=5000)
