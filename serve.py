@@ -534,10 +534,19 @@ def handle_processed_result(processed: Dict, session_state: SessionState, safe_t
 
 def apply_first_letter_lock(transcript: str, session_state: SessionState) -> tuple:
     """
-    🔒 Apply first letter lock to the FIRST WORD before joining
-    🔥 FIXED: Returns (corrected_transcript, dict_or_None) instead of (transcript, list)
-    Returns: (corrected_transcript, {'options': [...], 'qty': '...'} or None)
+    🔒 Apply first letter lock to the FIRST WORD before joining.
+
+    Returns:
+        (corrected_transcript,
+         {'options': [...], 'qty': '...'} OR None)
+
+    Flow handled here:
+        ✅ Letter similarity correction via SIMILAR_CHARS
+        ✅ Numeric prefix fallback (0,3,8,9)
+        ✅ Single match auto-fix
+        ✅ Multiple matches → UI selector
     """
+
     if not transcript:
         return transcript, None
 
@@ -545,7 +554,10 @@ def apply_first_letter_lock(transcript: str, session_state: SessionState) -> tup
     if not transcript_stripped:
         return transcript, None
 
-    # Remove special characters
+    # --------------------------------------------------
+    # --------------------------------------------------
+    # CLEAN TEXT
+    # --------------------------------------------------
     transcript_cleaned = re.sub(r'[-,./\\()\[\]{}|;:\'"@#$%^&*+=~`<>?]', '', transcript_stripped)
     transcript_cleaned = transcript_cleaned.strip()
 
@@ -554,90 +566,144 @@ def apply_first_letter_lock(transcript: str, session_state: SessionState) -> tup
     if not transcript_cleaned:
         return transcript, None
 
-    # Apply first letter lock
+    # --------------------------------------------------
+    # APPLY FIRST LETTER LOCK (manual override)
+    # --------------------------------------------------
     if session_state.first_letter_lock:
         words = transcript_cleaned.split()
+
+        def is_pure_letters(word):
+            return word.isalpha()
 
         if words:
             first_word = words[0]
 
-            def is_pure_letters(word):
-                return word.isalpha()
-
             if len(words) > 1 and is_pure_letters(first_word):
                 words[0] = session_state.first_letter_lock
-                print(
-                    f"🔧 REPLACED FIRST WORD: '{first_word}' → '{session_state.first_letter_lock}' (pure letters word)")
+                print(f"🔧 REPLACED FIRST WORD: '{first_word}' → '{words[0]}'")
             else:
-                if len(first_word) > 0:
-                    words[0] = session_state.first_letter_lock + first_word[1:]
-                    print(
-                        f"🔧 REPLACED FIRST CHAR: '{first_word}' → '{words[0]}' (contains digits or single word)")
+                words[0] = session_state.first_letter_lock + first_word[1:]
+                print(f"🔧 REPLACED FIRST CHAR: '{first_word}' → '{words[0]}'")
 
-            transcript_cleaned = ' '.join(words)
+            transcript_cleaned = " ".join(words)
             print(f"🔒 APPLIED FIRST LETTER LOCK: '{transcript_stripped}' → '{transcript_cleaned}'")
 
-    # 🔥 FIXED: Check for '8' or '3' prefix fallback - return dict with options and qty
-    if transcript_cleaned and (
-            transcript_cleaned[0] == '8' or transcript_cleaned[0] == '3' or transcript_cleaned[
-        0] == '0' or transcript_cleaned[0] == '9'):
-        transcript_no_space = transcript_cleaned.replace(' ', '')
+    transcript_no_space = transcript_cleaned.replace(" ", "")
+
+    # --------------------------------------------------
+    # 🅰 LETTER FIRST-CHAR SIMILARITY FIX (P→E/B/F etc.)
+    # --------------------------------------------------
+    if transcript_no_space and transcript_no_space[0].isalpha():
+
+        if len(transcript_no_space) >= 5:
+            prefix = transcript_no_space[0].lower()
+            suffix = transcript_no_space[1:5]
+            remaining = transcript_no_space[5:]
+
+            candidate = prefix + suffix
+
+            # Skip similarity if exact already exists
+            if not product_manager.exists(candidate):
+
+                if prefix in UltraTextProcessor.SIMILAR_CHARS:
+                    possible = []
+
+                    for repl in UltraTextProcessor.SIMILAR_CHARS[prefix]:
+                        test_code = repl.lower() + suffix
+
+                        if product_manager.exists(test_code):
+                            possible.append(
+                                product_manager.get_exact_case(test_code)
+                            )
+                            print(f"  ✓ Letter-similar match: {test_code}")
+
+                    if possible:
+                        # Extract qty
+                        qty = ""
+                        if remaining:
+                            digits_only = re.sub(r"\D", "", remaining)
+                            if digits_only and 1 <= int(digits_only) <= 9999:
+                                qty = digits_only
+
+                        # ✅ SINGLE MATCH → AUTO FIX
+                        if len(possible) == 1:
+                            final_code = possible[0] + (remaining if not qty else "")
+                            print(f"✅ LETTER SIMILAR FIX: '{candidate}' → '{final_code}'")
+                            return final_code, {'options': possible, 'qty': qty}
+
+                        # 🔀 MULTIPLE → OPTIONS UI
+                        print(f"🔀 MULTIPLE LETTER SIMILAR MATCHES: {possible}")
+                        return transcript_cleaned, {'options': possible, 'qty': qty}
+
+
+    # --------------------------------------------------
+    # 🔢 NUMERIC PREFIX FIX (0,3,8,9 → letters)
+    # --------------------------------------------------
+    if transcript_no_space and transcript_no_space[0] in {"0", "3", "8", "9"}:
 
         if len(transcript_no_space) >= 5:
             prefix = transcript_no_space[0]
-            suffix = transcript_no_space[1:5]  # 4-digit part
-            remaining = transcript_no_space[5:]  # qty or extra text
+            suffix = transcript_no_space[1:5]
+            remaining = transcript_no_space[5:]
 
             # -----------------------------
-            # CASE 1: Prefix is '3' → try real product 3XXXX first
+            # CASE 1: REAL 3XXXX KM PRODUCTS
             # -----------------------------
-            if prefix == '3':
+            if prefix == "3":
                 real_candidate = "3" + suffix
+
                 if product_manager.exists(real_candidate):
-                    print(f"✅ REAL MATCH DETECTED: {real_candidate}")
-                    # Extract qty from remaining if present
+                    print(f"✅ REAL NUMERIC MATCH: {real_candidate}")
+
                     qty = ""
                     if remaining:
-                        digits_only = re.sub(r'\D', '', remaining)
+                        digits_only = re.sub(r"\D", "", remaining)
                         if digits_only and 1 <= int(digits_only) <= 9999:
                             qty = digits_only
-                    # Return as single option with qty
-                    return real_candidate + (remaining if not qty else ""), {
-                        'options': [real_candidate], 'qty': qty}
+
+                    return (
+                        real_candidate + (remaining if not qty else ""),
+                        {'options': [real_candidate], 'qty': qty}
+                    )
 
             # -----------------------------
-            # CASE 2: Prefix is '8' OR fallback for '3'
-            # → Try letter-based correction
+            # CASE 2: DIGIT MIS-HEARD AS LETTER
             # -----------------------------
-            print(f"🔍 Searching for letter matches with suffix '{suffix}'")
+            print(f"🔍 Searching letter matches for numeric prefix + suffix '{suffix}'")
 
             possible = []
+
             for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
-                candidate = letter + suffix
-                if product_manager.exists(candidate):
-                    possible.append(candidate)
-                    print(f"  ✓ Match: {candidate}")
+                test_code = letter.lower() + suffix
+
+                if product_manager.exists(test_code):
+                    possible.append(
+                        product_manager.get_exact_case(test_code)
+                    )
+                    print(f"  ✓ Numeric-fix match: {test_code}")
 
             if possible:
-                # 🔥 FIXED: Extract quantity from remaining digits
                 qty = ""
                 if remaining:
-                    digits_only = re.sub(r'\D', '', remaining)
+                    digits_only = re.sub(r"\D", "", remaining)
                     if digits_only and 1 <= int(digits_only) <= 9999:
                         qty = digits_only
-                        print(f"📦 MULTIPLE OPTIONS + QTY: {qty}")
 
+                # ✅ SINGLE → AUTO FIX
                 if len(possible) == 1:
                     final_code = possible[0] + (remaining if not qty else "")
-                    print(f"🔁 PREFIX FIXED USING LETTER DICTIONARY: {final_code}")
+                    print(f"🔁 NUMERIC PREFIX FIX: {final_code}")
                     return final_code, {'options': possible, 'qty': qty}
-                else:
-                    print(f"🔀 Multiple matches: {possible}")
-                    # 🔥 FIXED: Return dict with options and extracted qty
-                    return possible[0], {'options': possible, 'qty': qty}
 
-    # No correction applied
+                # 🔀 MULTIPLE → OPTIONS UI
+                print(f"🔀 MULTIPLE NUMERIC PREFIX MATCHES: {possible}")
+                return transcript_cleaned, {'options': possible, 'qty': qty}
+
+    # --------------------------------------------------
+    # NO LOCK/CORRECTION APPLIED
+    # --------------------------------------------------
     return transcript_cleaned, None
+
 
 
 class ProductListManager:
@@ -711,14 +777,14 @@ class UltraTextProcessor:
     SIMILAR_CHARS = {
         'a': ['e', 'o', 'j'], 'b': ['d', 'p', 'v'], 'c': ['s', 'k', 'g'],
         'd': ['b', 't'], 'e': ['a', 'i', 'p'], 'f': ['v', 'p', 's'],
-        'g': ['j', 'k', 'c'], 'h': ['n'], 'i': ['e', 'y'],
+        'g': ['j', 'k', 'c'], 'h': ['n'], 'i': ['e', 'y', 'l'],
         'j': ['g', 'a'], 'k': ['c', 'g', 'q'], 'l': ['r', 'i'],
-        'm': ['n'], 'n': ['m'], 'o': ['a', 'u'],
-        'p': ['b', 'f', 'e'], 'q': ['k'], 'r': ['l'],
-        's': ['f', 'c', 'z'], 't': ['d'], 'u': ['o'],
-        'v': ['f', 'w'], 'w': ['v', 'double'], 'x': ['z'],
-        'y': ['i'], 'z': ['s', 'x'],
+        'm': ['n'], 'n': ['m', 'h'], 'o': ['a', 'u'], 'p': ['b', 'f', 'e'],
+        'q': ['k'], 'r': ['l'], 's': ['f', 'c', 'z'], 't': ['d'],
+        'u': ['o'], 'v': ['f', 'w', 'b'], 'w': ['v', 'double'], 'x': ['z'], 'y': ['i'],
+        'z': ['s', 'x'], 'double': ['w']
     }
+
 
     @staticmethod
     def clean_text(text: str, product_manager: ProductListManager = None) -> str:
